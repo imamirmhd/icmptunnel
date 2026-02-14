@@ -107,7 +107,7 @@ func (s *Socket) Send(srcIP, destIP net.IP, icmpType uint8, id, seq uint16, payl
 	binary.BigEndian.PutUint16(packet[22:24], cksum)
 
 	// Set write deadline
-	tv := syscall.Timeval{Sec: int64(s.writeTimeout.Seconds())}
+	tv := syscall.NsecToTimeval(s.writeTimeout.Nanoseconds())
 	syscall.SetsockoptTimeval(s.fd, syscall.SOL_SOCKET, syscall.SO_SNDTIMEO, &tv)
 
 	// Send
@@ -139,7 +139,7 @@ func (s *Socket) Receive() (srcIP net.IP, icmpType uint8, id, seq uint16, payloa
 	buf := make([]byte, s.maxPacketSize+20+8)
 
 	// Set read deadline
-	tv := syscall.Timeval{Sec: int64(s.readTimeout.Seconds())}
+	tv := syscall.NsecToTimeval(s.readTimeout.Nanoseconds())
 	syscall.SetsockoptTimeval(s.fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
 
 	n, from, err := syscall.Recvfrom(s.fd, buf, 0)
