@@ -326,7 +326,7 @@ func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 	case icmp.TypeAuth, icmp.TypeDiag, icmp.TypeData, icmp.TypeControl:
 		session := s.sessionMgr.GetSession(pkt.SessionID)
 		if pkt.Type != icmp.TypeAuth && (session == nil || !session.Authenticated) {
-			s.log.Warn("Packet from unauthenticated session %08x", pkt.SessionID)
+			s.log.Debug("Packet from unauthenticated session %08x", pkt.SessionID)
 			
 			// Send AuthFail to trigger client reconnect
 			failPkt := &icmp.TunnelPacket{
@@ -347,10 +347,25 @@ func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 		var pkts []*icmp.TunnelPacket
 		if session != nil {
 			pkts = session.ProcessIncoming(pkt)
-			if pkts == nil && session.IsDuplicate(pkt.SeqNum) && pkt.Type == icmp.TypeControl {
-				s.log.Debug("Re-acknowledging duplicate control packet %d", pkt.SeqNum)
-				s.handleControl(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, session, pkt)
-				return
+			if pkts == nil && session.IsDuplicate(pkt.SeqNum) {
+				s.log.Debug("Received duplicate packet %d (type %d)", pkt.SeqNum, pkt.Type)
+				
+				if pkt.Type == icmp.TypeControl {
+					s.log.Debug("Re-acknowledging duplicate control packet %d", pkt.SeqNum)
+					s.handleControl(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, session, pkt)
+					return
+				} else if pkt.Type == icmp.TypeData {
+					// Duplicate Data packet: Re-send ACK so client stops retransmitting
+					s.log.Debug("Re-acknowledging duplicate data packet %d", pkt.SeqNum)
+					ackPkt := &icmp.TunnelPacket{
+						Type:      icmp.TypeControl,
+						SessionID: session.ID,
+						SeqNum:    session.GetNextSeq(),
+						Data:      icmp.EncodeControlMessage(icmp.ControlACK, pkt.SeqNum),
+					}
+					s.sendResponse(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, ackPkt)
+					return
+				}
 			}
 		} else {
 			pkts = []*icmp.TunnelPacket{pkt}
@@ -398,7 +413,7 @@ func (s *Server) handleAuth(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 		s.log.Warn("Authentication failed for %s", clientIP)
 	}
 
-	var seqNum uint16
+	var seqNum uint32
 	if session != nil {
 		seqNum = session.GetNextSeq()
 	}
@@ -435,12 +450,8 @@ func (s *Server) handleData(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 			continue
 		}
 
-		// Buffer full - non-blocking send logic:
-		select {
-		case stream.DataChan <- entry.Data:
-		default:
-			// Drop if full to avoid blocking dispatcher
-		}
+		// Buffer full - block to implement backpressure
+		stream.DataChan <- entry.Data
 	}
 
 	// Immediate ACK to stop client retransmissions
@@ -455,13 +466,14 @@ func (s *Server) handleData(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 
 func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, icmpID, icmpSeq uint16, session *icmp.Session, pkt *icmp.TunnelPacket) {
 	// Handle control messages
-	subtype, streamID, err := icmp.DecodeControlMessage(pkt.Data)
+	subtype, value, err := icmp.DecodeControlMessage(pkt.Data)
 	if err != nil {
 		s.log.Error("Decode control: %v", err)
 		return
 	}
 	
-	s.log.Debug("Received Control packet: subtype=%d, streamID=%d from %s", subtype, streamID, clientIP)
+	streamID := uint16(value)
+	s.log.Debug("Received Control packet: subtype=%d, value=%d from %s", subtype, value, clientIP)
 
 	switch subtype {
 	case icmp.ControlConnect:
@@ -487,7 +499,7 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 				Type:      icmp.TypeControl,
 				SessionID: session.ID,
 				SeqNum:    session.GetNextSeq(),
-				Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, req.StreamID),
+				Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, uint32(req.StreamID)),
 			}
 			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
 			break
@@ -528,7 +540,7 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 				Type:      icmp.TypeControl,
 				SessionID: session.ID,
 				SeqNum:    session.GetNextSeq(),
-				Data:      icmp.EncodeControlMessage(icmp.ControlConnectFail, req.StreamID),
+				Data:      icmp.EncodeControlMessage(icmp.ControlConnectFail, uint32(req.StreamID)),
 			}
 			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, failPkt)
 			break
@@ -545,7 +557,7 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 			Type:      icmp.TypeControl,
 			SessionID: session.ID,
 			SeqNum:    session.GetNextSeq(),
-			Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, req.StreamID),
+			Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, uint32(req.StreamID)),
 		}
 		session.RecordSent(ackPkt)
 		s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
@@ -625,7 +637,7 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 							Type:      icmp.TypeControl,
 							SessionID: session.ID,
 							SeqNum:    session.GetNextSeq(),
-							Data:      icmp.EncodeControlMessage(icmp.ControlClose, req.StreamID),
+							Data:      icmp.EncodeControlMessage(icmp.ControlClose, uint32(req.StreamID)),
 						}
 						s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, closePkt)
 						return
@@ -640,7 +652,7 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 						Type:      icmp.TypeControl,
 						SessionID: session.ID,
 						SeqNum:    session.GetNextSeq(),
-						Data:      icmp.EncodeControlMessage(icmp.ControlClose, req.StreamID),
+						Data:      icmp.EncodeControlMessage(icmp.ControlClose, uint32(req.StreamID)),
 					}
 					s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, closePkt)
 					return
@@ -676,7 +688,7 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 	case icmp.ControlACK:
 		// The client is ACKing a packet we sent. Process it to clear inflight.
 		if session != nil {
-			session.ProcessACK(streamID, nil)
+			session.ProcessACK(value, nil)
 		}
 
 	case icmp.ControlSACK:

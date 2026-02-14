@@ -96,7 +96,7 @@ func DecodeAllStreamData(payload []byte) ([]StreamEntry, error) {
 }
 
 // TunnelHeaderSize is the size of the tunnel packet header.
-const TunnelHeaderSize = 9 // 1 flags + 4 session_id + 2 seq_num + 2 data_len
+const TunnelHeaderSize = 11 // 1 flags + 4 session_id + 4 seq_num + 2 data_len
 
 // TunnelPacket represents a tunnel protocol packet carried inside ICMP payload.
 //
@@ -116,7 +116,7 @@ type TunnelPacket struct {
 	Type      uint8  // Packet type (TypeData, TypeAuth, etc.)
 	Flags     uint8  // Additional flags
 	SessionID uint32 // Session identifier
-	SeqNum    uint16 // Sequence number
+	SeqNum    uint32 // Sequence number
 	Data      []byte // Payload data
 
 	// In-memory metadata (not encoded)
@@ -133,11 +133,11 @@ func (p *TunnelPacket) Encode() []byte {
 	buf[0] = (p.Type & 0x03) | p.Flags
 
 	binary.BigEndian.PutUint32(buf[1:5], p.SessionID)
-	binary.BigEndian.PutUint16(buf[5:7], p.SeqNum)
-	binary.BigEndian.PutUint16(buf[7:9], uint16(dataLen))
+	binary.BigEndian.PutUint32(buf[5:9], p.SeqNum)
+	binary.BigEndian.PutUint16(buf[9:11], uint16(dataLen))
 
 	if dataLen > 0 {
-		copy(buf[9:], p.Data)
+		copy(buf[11:], p.Data)
 	}
 
 	return buf
@@ -150,7 +150,7 @@ func DecodeTunnelPacket(data []byte) (*TunnelPacket, error) {
 	}
 
 	flags := data[0]
-	dataLen := binary.BigEndian.Uint16(data[7:9])
+	dataLen := binary.BigEndian.Uint16(data[9:11])
 
 	if len(data) < TunnelHeaderSize+int(dataLen) {
 		return nil, fmt.Errorf("data too short for declared payload: need %d, have %d",
@@ -161,12 +161,12 @@ func DecodeTunnelPacket(data []byte) (*TunnelPacket, error) {
 		Type:      flags & 0x03,
 		Flags:     flags & 0xFC, // upper 6 bits
 		SessionID: binary.BigEndian.Uint32(data[1:5]),
-		SeqNum:    binary.BigEndian.Uint16(data[5:7]),
+		SeqNum:    binary.BigEndian.Uint32(data[5:9]),
 	}
 
 	if dataLen > 0 {
 		p.Data = make([]byte, dataLen)
-		copy(p.Data, data[9:9+dataLen])
+		copy(p.Data, data[11:11+dataLen])
 	}
 
 	return p, nil

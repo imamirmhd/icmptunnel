@@ -31,7 +31,7 @@ type Client struct {
 	streams    map[uint16]chan []byte
 	streamsMu  sync.RWMutex
 	pendingStreams map[uint16]chan error
-	pendingAcks    map[uint16]chan error
+	pendingAcks    map[uint32]chan error
 	pendingMu      sync.Mutex
 	socks5     []*proxy.Socks5Server
 	forwarders []*proxy.Forwarder
@@ -104,7 +104,7 @@ func NewClient(cfg *config.ClientConfig) (*Client, error) {
 		serverAddr: serverAddr,
 		streams:        make(map[uint16]chan []byte),
 		pendingStreams: make(map[uint16]chan error),
-		pendingAcks:    make(map[uint16]chan error),
+		pendingAcks:    make(map[uint32]chan error),
 		log:            log,
 		done:       make(chan struct{}),
 		authCh:     make(chan error, 1),
@@ -311,7 +311,7 @@ func (c *Client) authenticate() error {
 func (c *Client) handleConnect(protocol, destination string) (uint16, chan []byte, error) {
 	streamID := icmp.GenerateStreamID()
 	c.log.Debug("Generated streamID %d for connection to %s", streamID, destination)
-	responseChan := make(chan []byte, 1024)
+	responseChan := make(chan []byte, 4096)
 	statusChan := make(chan error, 1)
 
 	c.streamsMu.Lock()
@@ -460,6 +460,64 @@ func (c *Client) statsLoop() {
 	}
 }
 
+func (c *Client) handleControl(subtype uint8, value uint32, rawPayload []byte) {
+	streamID := uint16(value)
+	switch subtype {
+	case icmp.ControlConnectACK:
+		c.pendingMu.Lock()
+		if ch, ok := c.pendingStreams[streamID]; ok {
+			ch <- nil
+			delete(c.pendingStreams, streamID)
+		}
+		c.pendingMu.Unlock()
+
+	case icmp.ControlConnectFail:
+		c.pendingMu.Lock()
+		if ch, ok := c.pendingStreams[streamID]; ok {
+			ch <- fmt.Errorf("server failed to connect to destination")
+			delete(c.pendingStreams, streamID)
+		}
+		c.pendingMu.Unlock()
+
+	case icmp.ControlClose:
+		c.handleClose(streamID)
+
+	case icmp.ControlACK:
+		// Server acked our data/control packet
+		c.session.ProcessACK(value, nil)
+		// Sync handling: notify any synchronous waiters
+		c.pendingMu.Lock()
+		if ch, ok := c.pendingAcks[value]; ok {
+			ch <- nil
+			delete(c.pendingAcks, value)
+		}
+		c.pendingMu.Unlock()
+
+	case icmp.ControlSACK:
+		sack, err := icmp.DecodeSACK(rawPayload)
+		if err == nil {
+			c.session.ProcessACK(sack.AckedSeq, sack.Blocks)
+		}
+
+	case icmp.ControlAuthOK:
+		c.session.Authenticated = true
+		select {
+		case c.authCh <- nil:
+		default:
+		}
+
+	case icmp.ControlAuthFail:
+		c.log.Warn("Received AuthFail from server, triggering reconnect")
+		select {
+		case c.authCh <- fmt.Errorf("server rejected authentication"):
+		default:
+		}
+		c.abortPending(fmt.Errorf("server rejected authentication"))
+		// If we are running, trigger reconnect
+		c.triggerReconnect()
+	}
+}
+
 func (c *Client) handleClose(streamID uint16) {
 	var needsSend bool
 
@@ -483,7 +541,7 @@ func (c *Client) handleClose(streamID uint16) {
 			Type:      icmp.TypeControl,
 			SessionID: c.session.ID,
 			SeqNum:    c.session.GetNextSeq(),
-			Data:      icmp.EncodeControlMessage(icmp.ControlClose, streamID),
+			Data:      icmp.EncodeControlMessage(icmp.ControlClose, uint32(streamID)),
 		}
 
 		select {
@@ -679,15 +737,28 @@ func (c *Client) receiveLoop() {
 		if tunnelPkt.Type == icmp.TypeControl {
 			subtype, _, _ := icmp.DecodeControlMessage(tunnelPkt.Data)
 			if subtype == icmp.ControlAuthFail {
-				c.log.Warn("Received AuthFail from server, triggering reconnect")
-				select {
-				case c.authCh <- fmt.Errorf("server rejected authentication"):
-				default:
-				}
-				c.abortPending(fmt.Errorf("server rejected authentication"))
+				c.log.Warn("Authentication failed or session expired")
 				c.triggerReconnect()
 				continue
 			}
+		}
+
+		// Sliding window check: packet must be within [NextRecvSeq, NextRecvSeq + WindowSize]
+		// Use circular distance for 32-bit space
+		diff := int32(tunnelPkt.SeqNum - c.session.NextRecvSeq)
+		if diff < 0 {
+			// Duplicate, re-ack
+			ackPkt := &icmp.TunnelPacket{
+				Type:      icmp.TypeControl,
+				SessionID: c.session.ID,
+				SeqNum:    c.session.GetNextSeq(),
+				Data:      icmp.EncodeControlMessage(icmp.ControlACK, tunnelPkt.SeqNum),
+			}
+			c.sendTunnelPacket(ackPkt)
+			continue
+		}
+		if diff >= 10000 { // Too far ahead
+			continue
 		}
 
 		// Reliability layer: sequencing and reordering
@@ -715,85 +786,19 @@ func (c *Client) receiveLoop() {
 				c.streamsMu.RLock()
 				for _, entry := range entries {
 					if ch, ok := c.streams[entry.StreamID]; ok {
-						select {
-						case ch <- entry.Data:
-						default:
-							// Drop if buffer full to avoid blocking the whole tunnel
-						}
+						ch <- entry.Data
 					}
 				}
 				c.streamsMu.RUnlock()
 
 			case icmp.TypeControl:
-				subtype, streamID, err := icmp.DecodeControlMessage(p.Data)
+				subtype, value, err := icmp.DecodeControlMessage(p.Data)
 				if err != nil {
 					continue
 				}
+				c.handleControl(subtype, value, p.Data)
 
-				switch subtype {
-				case icmp.ControlConnectACK:
-					c.pendingMu.Lock()
-					if ch, ok := c.pendingStreams[streamID]; ok {
-						ch <- nil
-						delete(c.pendingStreams, streamID)
-					}
-					c.pendingMu.Unlock()
-
-				case icmp.ControlConnectFail:
-					c.pendingMu.Lock()
-					if ch, ok := c.pendingStreams[streamID]; ok {
-						ch <- fmt.Errorf("server failed to connect to destination")
-						delete(c.pendingStreams, streamID)
-					}
-					c.pendingMu.Unlock()
-
-				case icmp.ControlClose:
-					c.handleClose(streamID)
-
-				case icmp.ControlHeartbeat:
-					if len(p.Data) >= 9 {
-						sentAt := int64(binary.BigEndian.Uint64(p.Data[1:9]))
-						elapsed := time.Now().UnixNano() - sentAt
-						c.session.UpdateRTT(time.Duration(elapsed))
-					}
-				case icmp.ControlACK:
-					// For ControlACK, streamID field carries the original SeqNum being ACKed
-					
-					// Reliability layer: mark as acknowledged
-					c.session.ProcessACK(streamID, nil)
-
-					// Sync handling: notify any synchronous waiters
-					c.pendingMu.Lock()
-					if ch, ok := c.pendingAcks[streamID]; ok {
-						ch <- nil
-						delete(c.pendingAcks, streamID)
-					}
-					c.pendingMu.Unlock()
-
-				case icmp.ControlSACK:
-					sack, err := icmp.DecodeSACK(p.Data)
-					if err == nil {
-						c.session.ProcessACK(sack.AckedSeq, sack.Blocks)
-					}
-				
-				case icmp.ControlAuthOK:
-					c.session.Authenticated = true
-					select {
-					case c.authCh <- nil:
-					default:
-					}
-				
-				case icmp.ControlAuthFail:
-					c.log.Warn("Received AuthFail from server, triggering reconnect")
-					select {
-					case c.authCh <- fmt.Errorf("server rejected authentication"):
-					default:
-					}
-					c.abortPending(fmt.Errorf("server rejected authentication"))
-					// If we are running, trigger reconnect
-					c.triggerReconnect()
-				}
-
+				// If it's not an ACK or SACK, send an ACK for this control packet
 				if subtype != icmp.ControlACK && subtype != icmp.ControlSACK {
 					ackPkt := &icmp.TunnelPacket{
 						Type:      icmp.TypeControl,

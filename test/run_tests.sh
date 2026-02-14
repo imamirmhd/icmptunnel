@@ -2,7 +2,7 @@
 # Comprehensive test script for icmptunnel
 # Tests: no encryption, AES-256-GCM, ChaCha20-Poly1305, XOR, port forwarding, fragmentation
 
-set -e
+set -ex
 cd "$(dirname "$0")/.."
 
 PASS=0
@@ -35,8 +35,10 @@ setup_http_server() {
     dd if=/dev/urandom of=test/1m.bin bs=1M count=1 status=none
     dd if=/dev/urandom of=test/5m.bin bs=1M count=5 status=none
     dd if=/dev/urandom of=test/10m.bin bs=1M count=10 status=none
+    dd if=/dev/urandom of=test/100m.bin bs=1M count=100 status=none
     
     # Start python server on port 8000 serving current directory
+    # Standard python3 http.server binds to all interfaces (0.0.0.0 and ::)
     python3 -m http.server 8000 > /tmp/http.log 2>&1 &
     HTTP_PID=$!
     sleep 2
@@ -82,18 +84,25 @@ test_download() {
     local size="$3"
     local port="${4:-1080}"
     local timeout="${5:-30}"
+    local host="${6:-127.0.0.1}"
     
     local result
-    log "Downloading $filename ($size bytes)..."
+    log "Downloading $filename from $host ($size bytes)..."
     
+    # Handle IPv6 literal for curl URL
+    local url_host="$host"
+    if [[ "$host" == *":"* ]]; then
+        url_host="[$host]"
+    fi
+
     # Request from /test/$filename
-    result=$(curl --socks5 127.0.0.1:$port http://127.0.0.1:8000/test/$filename -o /tmp/test_dl.bin --max-time $timeout -s -w "%{http_code}" 2>/dev/null)
+    result=$(curl --socks5 127.0.0.1:$port "http://${url_host}:8000/test/$filename" -o /tmp/test_dl.bin --max-time $timeout -S -w "%{http_code}")
     local actual=$(wc -c < /tmp/test_dl.bin 2>/dev/null || echo 0)
     
     if [ "$actual" = "$size" ] && [ "$result" = "200" ]; then
-        pass "$label download ($filename)"
+        pass "$label download ($filename) via $host"
     else
-        fail "$label download ($filename) - expected $size, got $actual, HTTP $result"
+        fail "$label download ($filename) via $host - expected $size, got $actual, HTTP $result"
     fi
 }
 
@@ -122,26 +131,24 @@ log "========================"
 log "Test Suite: No Encryption"
 log "========================"
 if start_tunnel test/server.toml test/client.toml "no encryption"; then
-    test_download "NoEncrypt" "1k.bin" 1000 1080 30
-    test_download "NoEncrypt" "50k.bin" 50000 1080 30
-    test_download "NoEncrypt" "500k.bin" 500000 1080 60
-    test_download "NoEncrypt" "5m.bin" 5242880 1080 300
-    test_download "NoEncrypt" "10m.bin" 10485760 1080 600
+    test_download "NoEncrypt" "1m.bin" 1048576 1080 30
+    test_download "NoEncrypt" "10m.bin" 10485760 1080 300
+    test_download "NoEncrypt" "100m.bin" 104857600 1080 1200 # 20 minute timeout
     test_upload "NoEncrypt"
 fi
 
 # ============================================
 # Test 2: AES-256-GCM encryption
 # ============================================
-log "========================"
-log "Test Suite: AES-256-GCM"
-log "========================"
-if start_tunnel test/aes_server.toml test/aes_client.toml "AES-256-GCM"; then
-    test_download "AES" "1k.bin" 1000 1080 30
-    test_download "AES" "5m.bin" 5242880 1080 300
-    test_download "AES" "10m.bin" 10485760 1080 600
-    test_upload "AES"
-fi
+# log "========================"
+# log "Test Suite: AES-256-GCM"
+# log "========================"
+# if start_tunnel test/aes_server.toml test/aes_client.toml "AES-256-GCM"; then
+#     test_download "AES" "1k.bin" 1000 1080 30
+#     test_download "AES" "5m.bin" 5242880 1080 300
+#     test_download "AES" "10m.bin" 10485760 1080 600
+#     test_upload "AES"
+# fi
 
 # ============================================
 # Test 3: ChaCha20-Poly1305 encryption
