@@ -683,6 +683,23 @@ func (s *Server) runDownlink(session *icmp.Session, stream *icmp.Stream, conn ne
 		default:
 		}
 
+		// Backpressure: wait if the congestion window is full
+		for {
+			if session.GetInflightCount() < session.GetCWND() {
+				break
+			}
+			select {
+			case <-s.done:
+				return
+			case <-stream.Done:
+				return
+			case <-session.Ctx.Done():
+				return
+			case <-time.After(10 * time.Millisecond):
+				// check again
+			}
+		}
+
 		conn.SetReadDeadline(time.Now().Add(time.Second))
 		n, err := conn.Read(buf)
 		if err != nil {
@@ -720,8 +737,12 @@ func (s *Server) runDownlink(session *icmp.Session, stream *icmp.Stream, conn ne
 			SeqNum:    session.GetNextSeq(),
 			Data:      icmp.EncodeStreamData(req.StreamID, buf[:n]),
 		}
+		s.log.Debug("Downlink: Sending data packet seq=%d (%d bytes)", dataPkt.SeqNum, n)
 		session.RecordSent(dataPkt)
 		s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, dataPkt)
+		
+		// Micro-delay to prevent flooding
+		time.Sleep(100 * time.Microsecond)
 	}
 }
 

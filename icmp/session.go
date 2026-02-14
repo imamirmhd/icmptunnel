@@ -264,8 +264,8 @@ func (s *Session) UpdateRTT(measured time.Duration) {
 		s.srtt = time.Duration(0.875*float64(s.srtt) + 0.125*float64(measured))
 	}
 	s.rto = s.srtt + 4*s.rttvar
-	if s.rto < 200*time.Millisecond {
-		s.rto = 200 * time.Millisecond
+	if s.rto < 50*time.Millisecond {
+		s.rto = 50 * time.Millisecond
 	}
 }
 
@@ -295,6 +295,20 @@ func (s *Session) GetRetransmissions() []*TunnelPacket {
 	}
 
 	return retrans
+}
+
+// GetInflightCount returns the number of in-flight packets.
+func (s *Session) GetInflightCount() int {
+	s.Mu.RLock()
+	defer s.Mu.RUnlock()
+	return len(s.inflight)
+}
+
+// GetCWND returns the current congestion window size.
+func (s *Session) GetCWND() int {
+	s.Mu.RLock()
+	defer s.Mu.RUnlock()
+	return s.cwnd
 }
 
 // GenerateSACK creates a SACK message based on received packets.

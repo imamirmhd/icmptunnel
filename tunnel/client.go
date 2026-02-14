@@ -809,7 +809,7 @@ func (c *Client) receiveLoop() {
 func (c *Client) heartbeatLoop() {
 	defer c.wg.Done()
 	heartbeatTicker := time.NewTicker(10 * time.Second)
-	sackTicker := time.NewTicker(50 * time.Millisecond)
+	sackTicker := time.NewTicker(5 * time.Millisecond)
 	defer heartbeatTicker.Stop()
 	defer sackTicker.Stop()
 
