@@ -415,10 +415,10 @@ The following test scenarios have been effectively verified on `icmptunnel v1.0`
 
 | valid | Test Case | Size | Result | Notes |
 |-------|-----------|------|--------|-------|
-| ✅ | **No Encryption** | 5 MB | **PASS** | Full throughput, no data corruption |
-| ✅ | **AES-256-GCM** | 5 MB | **PASS** | High integrity, authenticated encryption |
-| ✅ | **ChaCha20-Poly1305** | 1 MB | **PASS** | Verified stream cipher performance |
-| ✅ | **XOR Obfuscation** | 1 MB | **PASS** | Basic obfuscation verified |
+| ✅ | **No Encryption** | 10 MB | **PASS** | Full throughput, no data corruption |
+| ✅ | **AES-256-GCM** | 10 MB | **PASS** | High integrity, authenticated encryption |
+| ✅ | **ChaCha20-Poly1305** | 10 MB | **PASS** | Verified stream cipher performance |
+| ✅ | **XOR Obfuscation** | 10 MB | **PASS** | Basic obfuscation verified |
 | ✅ | **Port Forwarding** | N/A | **PASS** | TCP traffic correctly forwarded to external service |
 | ✅ | **Fragmentation** | 1 KB | **PASS** | Validated reassembly of fragmented packets |
 

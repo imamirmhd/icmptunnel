@@ -34,6 +34,7 @@ setup_http_server() {
     dd if=/dev/urandom of=test/500k.bin bs=1000 count=500 status=none
     dd if=/dev/urandom of=test/1m.bin bs=1M count=1 status=none
     dd if=/dev/urandom of=test/5m.bin bs=1M count=5 status=none
+    dd if=/dev/urandom of=test/10m.bin bs=1M count=10 status=none
     
     # Start python server on port 8000 serving current directory
     python3 -m http.server 8000 > /tmp/http.log 2>&1 &
@@ -124,8 +125,8 @@ if start_tunnel test/server.toml test/client.toml "no encryption"; then
     test_download "NoEncrypt" "1k.bin" 1000 1080 30
     test_download "NoEncrypt" "50k.bin" 50000 1080 30
     test_download "NoEncrypt" "500k.bin" 500000 1080 60
-    test_download "NoEncrypt" "1m.bin" 1048576 1080 120
     test_download "NoEncrypt" "5m.bin" 5242880 1080 300
+    test_download "NoEncrypt" "10m.bin" 10485760 1080 600
     test_upload "NoEncrypt"
 fi
 
@@ -137,8 +138,8 @@ log "Test Suite: AES-256-GCM"
 log "========================"
 if start_tunnel test/aes_server.toml test/aes_client.toml "AES-256-GCM"; then
     test_download "AES" "1k.bin" 1000 1080 30
-    test_download "AES" "500k.bin" 500000 1080 60
     test_download "AES" "5m.bin" 5242880 1080 300
+    test_download "AES" "10m.bin" 10485760 1080 600
     test_upload "AES"
 fi
 
@@ -150,7 +151,8 @@ log "Test Suite: ChaCha20-Poly1305"
 log "========================"
 if start_tunnel test/chacha_server.toml test/chacha_client.toml "ChaCha20-Poly1305"; then
     test_download "ChaCha20" "1k.bin" 1000 1080 30
-    test_download "ChaCha20" "1m.bin" 1048576 1080 120
+    test_download "ChaCha20" "5m.bin" 5242880 1080 300
+    test_download "ChaCha20" "10m.bin" 10485760 1080 600
     test_upload "ChaCha20"
 fi
 
@@ -162,7 +164,8 @@ log "Test Suite: XOR Obfuscation"
 log "========================"
 if start_tunnel test/xor_server.toml test/xor_client.toml "XOR obfuscation"; then
     test_download "XOR" "1k.bin" 1000 1080 30
-    test_download "XOR" "1m.bin" 1048576 1080 120
+    test_download "XOR" "5m.bin" 5242880 1080 300
+    test_download "XOR" "10m.bin" 10485760 1080 600
     test_upload "XOR"
 fi
 
