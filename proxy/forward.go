@@ -1,0 +1,232 @@
+package proxy
+
+import (
+	"fmt"
+	"net"
+	"sync"
+
+	"github.com/user/icmptunnel/logger"
+)
+
+// Forwarder handles TCP and UDP port forwarding rules.
+type Forwarder struct {
+	listen      string
+	destination string
+	protocol    string
+	onConnect   ConnectHandler
+	onData      DataHandler
+	onClose     CloseHandler
+	listener    net.Listener
+	udpConn     *net.UDPConn
+	log         *logger.Logger
+	wg          sync.WaitGroup
+	done        chan struct{}
+}
+
+// NewForwarder creates a new port forwarder.
+func NewForwarder(listen, destination, protocol string,
+	onConnect ConnectHandler, onData DataHandler, onClose CloseHandler) *Forwarder {
+	return &Forwarder{
+		listen:      listen,
+		destination: destination,
+		protocol:    protocol,
+		onConnect:   onConnect,
+		onData:      onData,
+		onClose:     onClose,
+		log:         logger.Default().WithComponent("forward"),
+		done:        make(chan struct{}),
+	}
+}
+
+// Start begins listening and forwarding connections.
+func (f *Forwarder) Start() error {
+	switch f.protocol {
+	case "tcp":
+		return f.startTCP()
+	case "udp":
+		return f.startUDP()
+	default:
+		return fmt.Errorf("unsupported protocol: %s", f.protocol)
+	}
+}
+
+// Stop shuts down the forwarder.
+func (f *Forwarder) Stop() {
+	close(f.done)
+	if f.listener != nil {
+		f.listener.Close()
+	}
+	if f.udpConn != nil {
+		f.udpConn.Close()
+	}
+	f.wg.Wait()
+}
+
+func (f *Forwarder) startTCP() error {
+	var err error
+	f.listener, err = net.Listen("tcp", f.listen)
+	if err != nil {
+		return fmt.Errorf("listening TCP on %s: %w", f.listen, err)
+	}
+
+	f.log.Info("TCP forwarder %s -> %s", f.listen, f.destination)
+
+	f.wg.Add(1)
+	go func() {
+		defer f.wg.Done()
+		for {
+			conn, err := f.listener.Accept()
+			if err != nil {
+				select {
+				case <-f.done:
+					return
+				default:
+					f.log.Error("TCP accept: %v", err)
+					continue
+				}
+			}
+			f.wg.Add(1)
+			go func() {
+				defer f.wg.Done()
+				f.handleTCPConn(conn)
+			}()
+		}
+	}()
+
+	return nil
+}
+
+func (f *Forwarder) handleTCPConn(conn net.Conn) {
+	defer conn.Close()
+
+	streamID, responseChan, err := f.onConnect("tcp", f.destination)
+	if err != nil {
+		f.log.Error("Connect failed: %v", err)
+		return
+	}
+	defer f.onClose(streamID)
+
+	doneCh := make(chan struct{}, 2)
+
+	// Local -> Tunnel
+	go func() {
+		defer func() { doneCh <- struct{}{} }()
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				return
+			}
+			if err := f.onData(streamID, buf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Tunnel -> Local
+	go func() {
+		defer func() { doneCh <- struct{}{} }()
+		for {
+			select {
+			case data, ok := <-responseChan:
+				if !ok {
+					return
+				}
+				if _, err := conn.Write(data); err != nil {
+					return
+				}
+			case <-f.done:
+				return
+			}
+		}
+	}()
+
+	<-doneCh
+}
+
+func (f *Forwarder) startUDP() error {
+	udpAddr, err := net.ResolveUDPAddr("udp", f.listen)
+	if err != nil {
+		return fmt.Errorf("resolving UDP address %s: %w", f.listen, err)
+	}
+
+	f.udpConn, err = net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return fmt.Errorf("listening UDP on %s: %w", f.listen, err)
+	}
+
+	f.log.Info("UDP forwarder %s -> %s", f.listen, f.destination)
+
+	// Track client addresses for response routing
+	type udpClient struct {
+		addr      *net.UDPAddr
+		streamID  uint16
+		respChan  chan []byte
+	}
+	clients := make(map[string]*udpClient)
+	var mu sync.Mutex
+
+	f.wg.Add(1)
+	go func() {
+		defer f.wg.Done()
+		buf := make([]byte, 65535)
+		for {
+			select {
+			case <-f.done:
+				return
+			default:
+			}
+
+			n, clientAddr, err := f.udpConn.ReadFromUDP(buf)
+			if err != nil {
+				select {
+				case <-f.done:
+					return
+				default:
+					f.log.Error("UDP read: %v", err)
+					continue
+				}
+			}
+
+			key := clientAddr.String()
+			mu.Lock()
+			client, exists := clients[key]
+			if !exists {
+				streamID, respChan, err := f.onConnect("udp", f.destination)
+				if err != nil {
+					mu.Unlock()
+					f.log.Error("UDP connect failed: %v", err)
+					continue
+				}
+				client = &udpClient{
+					addr:     clientAddr,
+					streamID: streamID,
+					respChan: respChan,
+				}
+				clients[key] = client
+
+				// Start response handler
+				go func(c *udpClient) {
+					for {
+						select {
+						case data, ok := <-c.respChan:
+							if !ok {
+								return
+							}
+							f.udpConn.WriteToUDP(data, c.addr)
+						case <-f.done:
+							return
+						}
+					}
+				}(client)
+			}
+			mu.Unlock()
+
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			f.onData(client.streamID, data)
+		}
+	}()
+
+	return nil
+}

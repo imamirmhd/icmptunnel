@@ -1,0 +1,13 @@
+# Binaries
+icmptunnel
+
+# Logs
+*.log
+nohup.out
+
+# Test environment
+test_env/
+http.pid
+
+# OS files
+.DS_Store
