@@ -417,9 +417,7 @@ func (c *Client) flushAggBuffer() {
 func (c *Client) senderLoop() {
 	defer c.wg.Done()
 	ticker := time.NewTicker(50 * time.Millisecond)
-	sackTicker := time.NewTicker(100 * time.Millisecond) // Send ACKs frequently to keep window moving
 	defer ticker.Stop()
-	defer sackTicker.Stop()
 
 	for {
 		select {
@@ -430,16 +428,6 @@ func (c *Client) senderLoop() {
 			for _, p := range retrans {
 				c.log.Debug("Retransmitting packet %d", p.SeqNum)
 				c.sendTunnelPacket(p)
-			}
-		case <-sackTicker.C:
-			// Send SACK/ACK to inform server of received packets
-			if c.session != nil {
-				sack := c.session.GenerateSACK()
-				// Only send SACK if we have received something (AckedSeq > 0 or Blocks exist)
-				// or if we just want to keep the connection alive/window moving.
-				// For now, always send to ensure server knows our state.
-				sackPkt := sack.EncodePacket(c.session.ID)
-				c.sendTunnelPacket(sackPkt)
 			}
 		}
 	}
@@ -786,10 +774,11 @@ func (c *Client) receiveLoop() {
 				c.streamsMu.RLock()
 				for _, entry := range entries {
 					if ch, ok := c.streams[entry.StreamID]; ok {
+						// Use short timeout to avoid dropping data during transient congestion
 						select {
 						case ch <- entry.Data:
-						default:
-							c.log.Warn("Stream %d buffer full, dropping data packet", entry.StreamID)
+						case <-time.After(10 * time.Millisecond):
+							c.log.Warn("Stream %d buffer full, dropping packet after timeout", entry.StreamID)
 						}
 					}
 				}
@@ -820,7 +809,7 @@ func (c *Client) receiveLoop() {
 func (c *Client) heartbeatLoop() {
 	defer c.wg.Done()
 	heartbeatTicker := time.NewTicker(10 * time.Second)
-	sackTicker := time.NewTicker(200 * time.Millisecond)
+	sackTicker := time.NewTicker(50 * time.Millisecond)
 	defer heartbeatTicker.Stop()
 	defer sackTicker.Stop()
 
@@ -857,19 +846,31 @@ func (c *Client) heartbeatLoop() {
 				c.triggerReconnect()
 			}
 		case <-sackTicker.C:
-			// Send SACK
+			// Send SACK or simple heartbeat pull more frequently when active
 			if c.session == nil {
 				continue
 			}
+
+			c.streamsMu.RLock()
+			activeStreams := len(c.streams)
+			c.streamsMu.RUnlock()
+
+			// If active, run faster (handled by ticker adjustment or just check)
+			// For now, let's keep 200ms but maybe we should make it faster.
+			// Actually, let's make it 50ms if active.
+			
 			sack := c.session.GenerateSACK()
-			if len(sack.Blocks) > 0 || sack.AckedSeq != c.session.NextSeqRecv - 1 {
+			// Always send SACK if we have active streams to "pull" data from server
+			if len(sack.Blocks) > 0 || sack.AckedSeq != c.session.NextSeqRecv - 1 || activeStreams > 0 {
 				sackPkt := &icmp.TunnelPacket{
 					Type:      icmp.TypeControl,
 					SessionID: c.session.ID,
 					SeqNum:    c.session.GetNextSeq(),
 					Data:      icmp.EncodeSACK(sack),
 				}
-				c.sendTunnelPacket(sackPkt)
+				if err := c.sendTunnelPacket(sackPkt); err != nil {
+					c.log.Debug("SACK pull failed: %v", err)
+				}
 			}
 		}
 	}

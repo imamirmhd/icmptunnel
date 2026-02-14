@@ -493,23 +493,83 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 
 	switch subtype {
 	case icmp.ControlConnect:
-		req, err := icmp.DecodeConnectRequest(pkt.Data)
-		if err != nil {
-			s.log.Error("Decode connect request: %v", err)
-			break
-		}
+		// Handle Connect asynchronously to avoid blocking the receiver loop
+		go func() {
+			req, err := icmp.DecodeConnectRequest(pkt.Data)
+			if err != nil {
+				s.log.Error("Decode connect request: %v", err)
+				return
+			}
 
-		s.log.Info("Connect request: stream=%d proto=%s dest=%s from %s",
-			req.StreamID, req.Protocol, req.Destination, clientIP)
+			s.log.Info("Connect request: stream=%d proto=%s dest=%s from %s",
+				req.StreamID, req.Protocol, req.Destination, clientIP)
 
-		connKey := fmt.Sprintf("%s:%d", clientIP, req.StreamID)
-		
-		s.connMu.RLock()
-		_, exists := s.connections[connKey]
-		s.connMu.RUnlock()
-		
-		if exists {
-			s.log.Debug("Connection for stream %s already exists, re-acknowledging", connKey)
+			connKey := fmt.Sprintf("%s:%d", clientIP, req.StreamID)
+			
+			s.connMu.RLock()
+			_, exists := s.connections[connKey]
+			s.connMu.RUnlock()
+			
+			if exists {
+				s.log.Debug("Connection for stream %s already exists, re-acknowledging", connKey)
+				ackPkt := &icmp.TunnelPacket{
+					Type:      icmp.TypeControl,
+					SessionID: session.ID,
+					SeqNum:    session.GetNextSeq(),
+					Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, uint32(req.StreamID)),
+				}
+				session.RecordSent(ackPkt)
+				s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
+				return
+			}
+
+			// Establish connection to destination
+			var conn net.Conn
+			var dErr error
+			switch req.Protocol {
+			case "tcp":
+				conn, dErr = net.DialTimeout("tcp", req.Destination, 10*time.Second)
+			case "udp":
+				conn, dErr = net.DialTimeout("udp", req.Destination, 10*time.Second)
+			default:
+				s.log.Error("Unsupported protocol: %s", req.Protocol)
+				return
+			}
+
+			if dErr != nil {
+				// Retry with IPv6 formatting if it contains a colon and isn't bracketed
+				dest := req.Destination
+				if strings.Contains(dest, ":") && !strings.HasPrefix(dest, "[") {
+					lastColon := strings.LastIndex(dest, ":")
+					if lastColon != -1 {
+						host := dest[:lastColon]
+						port := dest[lastColon+1:]
+						ipv6Dest := net.JoinHostPort(host, port)
+						s.log.Debug("Retrying connection with IPv6 formatting: %s", ipv6Dest)
+						conn, dErr = net.DialTimeout(req.Protocol, ipv6Dest, 10*time.Second)
+					}
+				}
+			}
+
+			if dErr != nil {
+				s.log.Error("Connect to %s failed: %v", req.Destination, dErr)
+				failPkt := &icmp.TunnelPacket{
+					Type:      icmp.TypeControl,
+					SessionID: session.ID,
+					SeqNum:    session.GetNextSeq(),
+					Data:      icmp.EncodeControlMessage(icmp.ControlConnectFail, uint32(req.StreamID)),
+				}
+				session.RecordSent(failPkt)
+				s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, failPkt)
+				return
+			}
+
+			s.connMu.Lock()
+			s.connections[connKey] = conn
+			s.connMu.Unlock()
+
+			stream := session.AddStreamWithID(req.StreamID, req.Protocol, req.Destination)
+
 			// Send connect ACK
 			ackPkt := &icmp.TunnelPacket{
 				Type:      icmp.TypeControl,
@@ -517,177 +577,27 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 				SeqNum:    session.GetNextSeq(),
 				Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, uint32(req.StreamID)),
 			}
+			session.RecordSent(ackPkt)
 			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
-			return
-		}
+			s.log.Info("Stream %d established to %s", req.StreamID, req.Destination)
 
-		// Establish connection to destination
-		var conn net.Conn
-		switch req.Protocol {
-		case "tcp":
-			conn, err = net.DialTimeout("tcp", req.Destination, 10*time.Second)
-		case "udp":
-			conn, err = net.DialTimeout("udp", req.Destination, 10*time.Second)
-		default:
-			s.log.Error("Unsupported protocol: %s", req.Protocol)
-			break
-		}
-
-		if err != nil {
-			// (IPv6 retry logic removed for brevity in this chunk, but I'll keep it)
-			dest := req.Destination
-			if strings.Contains(dest, ":") && !strings.HasPrefix(dest, "[") {
-				lastColon := strings.LastIndex(dest, ":")
-				if lastColon != -1 {
-					host := dest[:lastColon]
-					port := dest[lastColon+1:]
-					ipv6Dest := net.JoinHostPort(host, port)
-					if ipv6Dest != dest {
-						s.log.Debug("Retrying connection with IPv6 formatting: %s", ipv6Dest)
-						conn, err = net.DialTimeout(req.Protocol, ipv6Dest, 10*time.Second)
-					}
-				}
-			}
-		}
-
-		if err != nil {
-			s.log.Error("Connect to %s failed: %v", req.Destination, err)
-			failPkt := &icmp.TunnelPacket{
-				Type:      icmp.TypeControl,
-				SessionID: session.ID,
-				SeqNum:    session.GetNextSeq(),
-				Data:      icmp.EncodeControlMessage(icmp.ControlConnectFail, uint32(req.StreamID)),
-			}
-			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, failPkt)
-			break
-		}
-
-		s.connMu.Lock()
-		s.connections[connKey] = conn
-		s.connMu.Unlock()
-
-		stream := session.AddStreamWithID(req.StreamID, req.Protocol, req.Destination)
-
-		// Send connect ACK
-		ackPkt := &icmp.TunnelPacket{
-			Type:      icmp.TypeControl,
-			SessionID: session.ID,
-			SeqNum:    session.GetNextSeq(),
-			Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, uint32(req.StreamID)),
-		}
-		session.RecordSent(ackPkt)
-		s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
-		s.log.Info("Stream %d established to %s", req.StreamID, req.Destination)
-
-		// Uplink Loop: Session -> Destination
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			defer func() {
-				conn.Close()
-				s.connMu.Lock()
-				delete(s.connections, connKey)
-				s.connMu.Unlock()
-				session.RemoveStream(req.StreamID)
-				s.log.Debug("Uplink loop for stream %d to %s finished", req.StreamID, req.Destination)
-			}()
-			for {
-				select {
-				case data, ok := <-stream.DataChan:
-					if !ok { 
-						s.log.Debug("Uplink: Stream %d DataChan closed", req.StreamID)
-						return 
-					}
-					s.log.Debug("Uplink: Writing %d bytes to %s for stream %d", len(data), req.Destination, req.StreamID)
-					if _, err := conn.Write(data); err != nil {
-						s.log.Error("Uplink: Write error to %s for stream %d: %v", req.Destination, req.StreamID, err)
-						return
-					}
-				case <-s.done:
-					s.log.Debug("Uplink: Server done signal received for stream %d", req.StreamID)
-					return
-				case <-stream.Done:
-					s.log.Debug("Uplink: Stream %d done signal received", req.StreamID)
-					return
-				}
-			}
+			// Start Uplink/Downlink loops
+			s.wg.Add(2)
+			go s.runUplink(session, stream, conn, connKey, req)
+			go s.runDownlink(session, stream, conn, connKey, clientIP, srcIP, routeFlag, relayIP, req)
 		}()
 
-		// Downlink Loop: Destination -> Session
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			defer func() {
-				// Note: Do NOT call session.RemoveStream here - the uplink goroutine
-				// handles stream removal. Calling it from both goroutines would
-				// double-close stream.Done and panic.
-				s.connMu.Lock()
-				delete(s.connections, connKey)
-				s.connMu.Unlock()
-				conn.Close()
-				s.log.Debug("Downlink loop for stream %d from %s finished", req.StreamID, req.Destination)
-			}()
-
-			maxData := s.calculateMaxStreamData()
-			buf := make([]byte, maxData)
-			for {
-				select {
-				case <-s.done:
-					s.log.Debug("Downlink: Server done signal received for stream %d", req.StreamID)
-					return
-				case <-stream.Done:
-					s.log.Debug("Downlink: Stream %d done signal received", req.StreamID)
-					return
-				case <-session.Ctx.Done():
-					s.log.Debug("Session %08x closed, stopping downlink loop for stream %d", session.ID, req.StreamID)
-					return
-				default:
-				}
-
-				conn.SetReadDeadline(time.Now().Add(time.Second))
-				n, err := conn.Read(buf)
-				if err != nil {
-					s.log.Debug("Read from %s: %v", req.Destination, err)
-					if err == io.EOF {
-						// Clean close
-						s.log.Debug("Downlink: EOF from %s for stream %d", req.Destination, req.StreamID)
-						// Inform client about close
-						closePkt := &icmp.TunnelPacket{
-							Type:      icmp.TypeControl,
-							SessionID: session.ID,
-							SeqNum:    session.GetNextSeq(),
-							Data:      icmp.EncodeControlMessage(icmp.ControlClose, uint32(req.StreamID)),
-						}
-						s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, closePkt)
-						return
-					}
-					// Check for "use of closed network connection" which happens on timeout or close
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						continue
-					}
-					s.log.Error("Downlink: Read error from %s for stream %d: %v", req.Destination, req.StreamID, err)
-					// Inform client about close
-					closePkt := &icmp.TunnelPacket{
-						Type:      icmp.TypeControl,
-						SessionID: session.ID,
-						SeqNum:    session.GetNextSeq(),
-						Data:      icmp.EncodeControlMessage(icmp.ControlClose, uint32(req.StreamID)),
-					}
-					s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, closePkt)
-					return
-				}
-				s.log.Debug("Downlink: Read %d bytes from %s for stream %d", n, req.Destination, req.StreamID)
-
-				dataPkt := &icmp.TunnelPacket{
-					Type:      icmp.TypeData,
-					SessionID: session.ID,
-					SeqNum:    session.GetNextSeq(),
-					Data:      icmp.EncodeStreamData(req.StreamID, buf[:n]),
-				}
-				session.RecordSent(dataPkt)
-				s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, dataPkt)
+	case icmp.ControlACK:
+		if session != nil {
+			session.ProcessACK(value, nil)
+		}
+	case icmp.ControlSACK:
+		if session != nil {
+			sack, err := icmp.DecodeSACK(pkt.Data)
+			if err == nil {
+				session.ProcessACK(sack.AckedSeq, sack.Blocks)
 			}
-		}()
+		}
 	case icmp.ControlClose:
 		connKey := fmt.Sprintf("%s:%d", clientIP, streamID)
 		s.connMu.Lock()
@@ -700,28 +610,11 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 		if session != nil {
 			session.RemoveStream(streamID)
 		}
-
 	case icmp.ControlHeartbeat:
-		// Just acknowledge activity
-
-	case icmp.ControlACK:
-		// The client is ACKing a packet we sent. Process it to clear inflight.
-		if session != nil {
-			session.ProcessACK(value, nil)
-		}
-
-	case icmp.ControlSACK:
-		if session != nil {
-			sack, err := icmp.DecodeSACK(pkt.Data)
-			if err == nil {
-				session.ProcessACK(sack.AckedSeq, sack.Blocks)
-			}
-		}
+		// Heartbeat just touches session activity
 	}
 
 	// Send ACK for control messages that don't already send their own response.
-	// ControlACK, ControlSACK, ControlConnect (sends ConnectACK/ConnectFail),
-	// and ControlHeartbeat should not get an extra ACK.
 	switch subtype {
 	case icmp.ControlACK, icmp.ControlSACK, icmp.ControlHeartbeat:
 		// These already have their own response or don't need ACK
@@ -735,6 +628,100 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 			}
 			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, ackPkt)
 		}
+	}
+}
+
+func (s *Server) runUplink(session *icmp.Session, stream *icmp.Stream, conn net.Conn, connKey string, req *icmp.ConnectRequest) {
+	defer s.wg.Done()
+	defer func() {
+		conn.Close()
+		s.connMu.Lock()
+		delete(s.connections, connKey)
+		s.connMu.Unlock()
+		session.RemoveStream(req.StreamID)
+		s.log.Debug("Uplink loop for stream %d to %s finished", req.StreamID, req.Destination)
+	}()
+
+	for {
+		select {
+		case data, ok := <-stream.DataChan:
+			if !ok {
+				return
+			}
+			s.log.Debug("Uplink: Writing %d bytes to %s for stream %d", len(data), req.Destination, req.StreamID)
+			if _, err := conn.Write(data); err != nil {
+				s.log.Error("Uplink: Write error to %s for stream %d: %v", req.Destination, req.StreamID, err)
+				return
+			}
+		case <-s.done:
+			return
+		case <-stream.Done:
+			return
+		}
+	}
+}
+
+func (s *Server) runDownlink(session *icmp.Session, stream *icmp.Stream, conn net.Conn, connKey string, clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, req *icmp.ConnectRequest) {
+	defer s.wg.Done()
+	defer func() {
+		conn.Close()
+		s.connMu.Lock()
+		delete(s.connections, connKey)
+		s.connMu.Unlock()
+	}()
+
+	maxData := s.calculateMaxStreamData()
+	buf := make([]byte, maxData)
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-stream.Done:
+			return
+		case <-session.Ctx.Done():
+			return
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(time.Second))
+		n, err := conn.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				s.log.Debug("Downlink: EOF from %s for stream %d", req.Destination, req.StreamID)
+				closePkt := &icmp.TunnelPacket{
+					Type:      icmp.TypeControl,
+					SessionID: session.ID,
+					SeqNum:    session.GetNextSeq(),
+					Data:      icmp.EncodeControlMessage(icmp.ControlClose, uint32(req.StreamID)),
+				}
+				session.RecordSent(closePkt)
+				s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, closePkt)
+				return
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			s.log.Error("Downlink: Read error from %s for stream %d: %v", req.Destination, req.StreamID, err)
+			closePkt := &icmp.TunnelPacket{
+				Type:      icmp.TypeControl,
+				SessionID: session.ID,
+				SeqNum:    session.GetNextSeq(),
+				Data:      icmp.EncodeControlMessage(icmp.ControlClose, uint32(req.StreamID)),
+			}
+			session.RecordSent(closePkt)
+			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, closePkt)
+			return
+		}
+
+		s.log.Debug("Downlink: Read %d bytes from %s for stream %d", n, req.Destination, req.StreamID)
+		dataPkt := &icmp.TunnelPacket{
+			Type:      icmp.TypeData,
+			SessionID: session.ID,
+			SeqNum:    session.GetNextSeq(),
+			Data:      icmp.EncodeStreamData(req.StreamID, buf[:n]),
+		}
+		session.RecordSent(dataPkt)
+		s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, dataPkt)
 	}
 }
 

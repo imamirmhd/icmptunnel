@@ -18,7 +18,7 @@ func createTestSession() *icmp.Session {
 func TestSACKEncodeDecode(t *testing.T) {
 	original := &icmp.SACK{
 		AckedSeq: 42,
-		Blocks:   []uint16{45, 47, 50, 50, 55, 60},
+		Blocks:   []uint32{45, 47, 50, 50, 55, 60},
 	}
 
 	encoded := icmp.EncodeSACK(original)
@@ -46,7 +46,7 @@ func TestSACKEncodeDecode(t *testing.T) {
 func TestSACKEncodePacket(t *testing.T) {
 	sack := &icmp.SACK{
 		AckedSeq: 100,
-		Blocks:   []uint16{105, 107},
+		Blocks:   []uint32{105, 107},
 	}
 
 	pkt := sack.EncodePacket(0xDEADBEEF)
@@ -104,7 +104,7 @@ func TestSACKTooShort(t *testing.T) {
 func TestControlMessageEncodeDecode(t *testing.T) {
 	testCases := []struct {
 		subtype  uint8
-		streamID uint16
+		streamID uint32
 	}{
 		{icmp.ControlConnect, 12345},
 		{icmp.ControlClose, 0},
@@ -138,14 +138,14 @@ func TestMaxStreamDataSizeConstants(t *testing.T) {
 	// Base calculation: maxPacketSize - 8 (ICMP header) - TunnelHeaderSize - StreamDataHeaderSize
 	room := maxPacketSize - 8 - icmp.TunnelHeaderSize - icmp.StreamDataHeaderSize
 
-	expectedRoom := 1472 - 8 - 9 - 4 // = 1451
+	expectedRoom := 1472 - 8 - 11 - 4 // = 1449
 	if room != expectedRoom {
 		t.Errorf("max stream data size = %d, want %d", room, expectedRoom)
 	}
 
 	// Verify the constant values match the packet format
-	if icmp.TunnelHeaderSize != 9 {
-		t.Errorf("TunnelHeaderSize = %d, want 9 (1B type+flags + 4B sessionID + 2B seqNum + 2B reserved)", icmp.TunnelHeaderSize)
+	if icmp.TunnelHeaderSize != 11 {
+		t.Errorf("TunnelHeaderSize = %d, want 11 (1B type+flags + 4B sessionID + 4B seqNum + 2B length)", icmp.TunnelHeaderSize)
 	}
 	if icmp.StreamDataHeaderSize != 4 {
 		t.Errorf("StreamDataHeaderSize = %d, want 4 (2B streamID + 2B dataLen)", icmp.StreamDataHeaderSize)
@@ -158,7 +158,7 @@ func TestProcessACKCumulativeAndSACK(t *testing.T) {
 	session := createTestSession()
 
 	// Record 5 sent packets with seq 1-5
-	for seq := uint16(1); seq <= 5; seq++ {
+	for seq := uint32(1); seq <= 5; seq++ {
 		session.RecordSent(&icmp.TunnelPacket{SeqNum: seq})
 	}
 
@@ -186,13 +186,13 @@ func TestProcessACKWithSACKBlocks(t *testing.T) {
 	session := createTestSession()
 
 	// Record packets 1-10
-	for seq := uint16(1); seq <= 10; seq++ {
+	for seq := uint32(1); seq <= 10; seq++ {
 		session.RecordSent(&icmp.TunnelPacket{SeqNum: seq})
 	}
 
 	// ACK cumulative=3 with SACK blocks [6,7] and [9,9]
 	// Should acknowledge: 1,2,3 (cumulative) + 6,7 (SACK) + 9 (SACK) = 6 total
-	sackBlocks := []uint16{6, 7, 9, 9}
+	sackBlocks := []uint32{6, 7, 9, 9}
 	acked := session.ProcessACK(3, sackBlocks)
 	if len(acked) != 6 {
 		t.Errorf("expected 6 acked, got %d", len(acked))
@@ -235,7 +235,7 @@ func TestGenerateSACK(t *testing.T) {
 	session.NextRecvSeq = 1
 
 	// Receive packets 1, 2, 3 in order
-	for seq := uint16(1); seq <= 3; seq++ {
+	for seq := uint32(1); seq <= 3; seq++ {
 		session.ProcessIncoming(&icmp.TunnelPacket{SeqNum: seq, Type: icmp.TypeData, Data: []byte("data")})
 	}
 
