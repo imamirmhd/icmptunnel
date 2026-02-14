@@ -7,3 +7,5 @@ test/local_*.toml
 .agent/
 .system_generated/
 .DS_Store
+server.toml
+client.toml

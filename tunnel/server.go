@@ -328,6 +328,19 @@ func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 		session := s.sessionMgr.GetSession(pkt.SessionID)
 		if pkt.Type != icmp.TypeAuth && (session == nil || !session.Authenticated) {
 			s.log.Warn("Packet from unauthenticated session %08x", pkt.SessionID)
+			
+			// Send AuthFail to trigger client reconnect
+			failPkt := &icmp.TunnelPacket{
+				Type:      icmp.TypeControl,
+				SessionID: pkt.SessionID,
+				SeqNum:    0,
+				Data:      icmp.EncodeControlMessage(icmp.ControlAuthFail, 0),
+			}
+			// We can't use session.RecordSent because we don't have a session.
+			// Just send it directly.
+			// Need to find which address to send to.
+			// handlePacket has srcIP.
+			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, failPkt)
 			return
 		}
 

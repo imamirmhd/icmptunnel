@@ -16,6 +16,7 @@ import (
 	"github.com/user/icmptunnel/icmp"
 	"github.com/user/icmptunnel/logger"
 	"github.com/user/icmptunnel/proxy"
+	"strings"
 )
 
 // Client manages the client side of the ICMP tunnel.
@@ -39,6 +40,9 @@ type Client struct {
 	log                *logger.Logger
 	done               chan struct{}
 	wg                 sync.WaitGroup
+	authCh             chan error
+	started            bool
+	mu                 sync.Mutex
 
 	// Aggregation & Pacing
 	aggMu     sync.Mutex
@@ -102,6 +106,7 @@ func NewClient(cfg *config.ClientConfig) (*Client, error) {
 		pendingAcks:    make(map[uint16]chan struct{}),
 		log:            log,
 		done:       make(chan struct{}),
+		authCh:     make(chan error, 1),
 		maxAgg:     cfg.ICMP.MaxPacketSize - 64, // Leave some room
 	}, nil
 }
@@ -146,6 +151,10 @@ func (c *Client) Start() error {
 	}
 
 	// Start loops
+	c.mu.Lock()
+	c.started = true
+	c.mu.Unlock()
+
 	c.wg.Add(3)
 	go c.heartbeatLoop()
 	go c.senderLoop()
@@ -177,7 +186,14 @@ func (c *Client) Wait() {
 
 func (c *Client) authenticate() error {
 	// Create a session
-	c.session = c.sessionMgr.CreateSession(c.localAddr)
+	if c.session == nil || !c.session.Authenticated {
+		// Only create new session if we don't have a valid one (or we are reconnecting)
+		// Actually reconnect() creates the session. Initial start does too.
+		// If we are here, c.session should be set by caller if it's a new session.
+		if c.session == nil {
+			c.session = c.sessionMgr.CreateSession(c.localAddr)
+		}
+	}
 
 	// Build auth packet with token
 	authData := []byte(c.cfg.AuthToken)
@@ -194,7 +210,22 @@ func (c *Client) authenticate() error {
 		return fmt.Errorf("sending auth: %w", err)
 	}
 
-	// Wait for auth response
+	// If main loop is running, wait on channel
+	c.mu.Lock()
+	running := c.started
+	c.mu.Unlock()
+
+	if running {
+		c.log.Info("Waiting for auth via main loop...")
+		select {
+		case err := <-c.authCh:
+			return err
+		case <-time.After(auth.AuthTimeout):
+			return fmt.Errorf("authentication timed out")
+		}
+	}
+
+	// Otherwise use local loop (initial start)
 	deadline := time.Now().Add(auth.AuthTimeout)
 	for time.Now().Before(deadline) {
 		_, _, _, _, rawPayload, err := c.socket.Receive()
@@ -205,8 +236,6 @@ func (c *Client) authenticate() error {
 		// Handle fragmentation and evasion
 		var reassembledData []byte
 		if c.cfg.Evasion.Fragmentation.Enabled {
-			// Note: authenticate loop doesn't currently handle stateful fragmentation reassembly
-			// since it's a simple synchronous loop. But adding standard Unapply for now.
 			processed, err := c.evasion.Unapply([][]byte{rawPayload})
 			if err != nil {
 				continue
@@ -230,15 +259,17 @@ func (c *Client) authenticate() error {
 			continue
 		}
 
-		if tunnelPkt.Type == icmp.TypeControl && tunnelPkt.SessionID == c.session.ID {
-			if len(tunnelPkt.Data) > 0 && tunnelPkt.Data[0] == icmp.ControlAuthOK {
-				c.session.Authenticated = true
-				c.session.MarkReceived(tunnelPkt.SeqNum) // Advance sequence
-				c.session.ProcessIncoming(tunnelPkt)   // Actually advance nextRecvSeq
-				return nil
-			}
-			if len(tunnelPkt.Data) > 0 && tunnelPkt.Data[0] == icmp.ControlAuthFail {
-				return fmt.Errorf("server rejected authentication")
+		if tunnelPkt.SessionID == c.session.ID {
+			if tunnelPkt.Type == icmp.TypeControl {
+				if len(tunnelPkt.Data) > 0 && tunnelPkt.Data[0] == icmp.ControlAuthOK {
+					c.session.Authenticated = true
+					c.session.MarkReceived(tunnelPkt.SeqNum) // Advance sequence
+					c.session.ProcessIncoming(tunnelPkt)   // Actually advance nextRecvSeq
+					return nil
+				}
+				if len(tunnelPkt.Data) > 0 && tunnelPkt.Data[0] == icmp.ControlAuthFail {
+					return fmt.Errorf("server rejected authentication")
+				}
 			}
 		}
 	}
@@ -501,6 +532,14 @@ func (c *Client) receiveLoop() {
 
 		_, _, _, _, rawPayload, err := c.socket.Receive()
 		if err != nil {
+			select {
+			case <-c.done:
+				return
+			default:
+			}
+			if strings.Contains(err.Error(), "closed") || strings.Contains(err.Error(), "bad file descriptor") {
+				return
+			}
 			continue
 		}
 
@@ -550,6 +589,20 @@ func (c *Client) receiveLoop() {
 			decomp, err := c.session.Decompress(tunnelPkt.Data)
 			if err == nil {
 				tunnelPkt.Data = decomp
+			}
+		}
+
+		// Check for ControlAuthFail immediately (bypassing sequence check)
+		if tunnelPkt.Type == icmp.TypeControl {
+			subtype, _, _ := icmp.DecodeControlMessage(tunnelPkt.Data)
+			if subtype == icmp.ControlAuthFail {
+				c.log.Warn("Received AuthFail from server, triggering reconnect")
+				select {
+				case c.authCh <- fmt.Errorf("server rejected authentication"):
+				default:
+				}
+				go c.reconnect()
+				continue
 			}
 		}
 
@@ -618,6 +671,22 @@ func (c *Client) receiveLoop() {
 					if err == nil {
 						c.session.ProcessACK(sack.AckedSeq, sack.Blocks)
 					}
+				
+				case icmp.ControlAuthOK:
+					c.session.Authenticated = true
+					select {
+					case c.authCh <- nil:
+					default:
+					}
+				
+				case icmp.ControlAuthFail:
+					c.log.Warn("Received AuthFail from server, triggering reconnect")
+					select {
+					case c.authCh <- fmt.Errorf("server rejected authentication"):
+					default:
+					}
+					// If we are running, trigger reconnect
+					go c.reconnect()
 				}
 			}
 		}
