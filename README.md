@@ -13,6 +13,7 @@
 | **Encryption** | AES-256-GCM, ChaCha20-Poly1305, or XOR obfuscation |
 | **DPI Evasion** | 6 techniques: fragmentation, padding, jitter, mimicry, checksum manipulation, adaptive sizing |
 | **ICMP Spoofing** | Relay-based spoofing for environments where direct ICMP is blocked |
+| **Transport Layer** | **NEW!** Sliding window, congestion control (CUBIC-like), SACK, and retransmissions for reliable delivery |
 | **Authentication** | Unified token-based validation for both session auth and ICMP connectivity |
 | **User-Space ICMP** | Application-level echo replies for reliability when kernel replies are disabled |
 | **Diagnostics** | Ping, throughput, packet loss, DPI detection, spoof verification |
@@ -285,26 +286,45 @@ For environments where direct ICMP to the server is blocked:
 3. The **main server** receives the packet, extracts the **real client IP** from the payload
 4. Server responds either **directly to the client** or **back through the relay**, based on a routing flag embedded in the payload
 
-### Setup
-
-```bash
-# On the relay (intermediary server)
-sudo ./icmptunnel relay --config relay.toml
-
-# Server config: enable relay support
-# [relay]
-# enabled = true
-
-# Client config: enable spoofing
-# [spoof]
-# enabled = true
-# relay_addr = "relay-ip"
-# route_via_relay = false
-```
-
-> ⚠️ IP spoofing requires: root privileges, `rp_filter=0` on the client, and a relay that does not drop forged-source packets.
-
-## Installation & Service Management
+288: ### Setup
+289: 
+290: ```bash
+291: # On the relay (intermediary server)
+292: sudo ./icmptunnel relay --config relay.toml
+293: 
+294: # Server config: enable relay support
+295: # [relay]
+296: # enabled = true
+297: 
+298: # Client config: enable spoofing
+299: # [spoof]
+300: # enabled = true
+301: # relay_addr = "relay-ip"
+302: # route_via_relay = false
+303: ```
+304: 
+305: > ⚠️ IP spoofing requires: root privileges, `rp_filter=0` on the client, and a relay that does not drop forged-source packets.
+306: 
+307: ## Transport Layer & Reliability
+308: 
+309: **icmptunnel v1.0** introduces a robust userspace transport layer on top of ICMP to guarantee reliable delivery, ordering, and congestion control:
+310: 
+311: - **Sliding Window**: Allows multiple packets in-flight (default window size: 100), significantly improving throughput over high-latency links.
+312: - **Selective Acknowledgment (SACK)**: Receivers report non-contiguous blocks of received packets, allowing the sender to retransmit only the missing data.
+313: - **Congestion Control**: Adapts transport speed based on packet loss and RTT, acting similar to TCP CUBIC but tuned for ICMP tunnels.
+314: - **Compression**: Real-time DEFLATE/LZ4 style compression to reduce bandwidth usage.
+315: - **Connection Resilience**: Automatic heartbeat mechanisms and exponential backoff reconnection strategies ensure the tunnel recovers from temporary outages.
+316: 
+317: Configure these settings in the `[transport]` section of your config:
+318: 
+319: ```toml
+320: [transport]
+321: window_size = 100
+322: compression = true
+323: retransmission_timeout = "200ms"
+324: ```
+325: 
+326: ## Installation & Service Management
 
 ### System Installation
 

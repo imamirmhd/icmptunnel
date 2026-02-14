@@ -80,6 +80,15 @@ enabled = false
 relay_addr = "198.51.100.1"     # Relay server IP
 route_via_relay = false          # true = responses via relay, false = direct
 
+# ─── Transport Settings ──────────────────────────────────────────────────────
+[transport]
+window_size = 100         # Sliding window size (packets in flight)
+max_payload = 1400        # Maximum tunnel payload size
+retransmission_timeout = "200ms"
+compression = true        # LZ4-style streaming compression
+stream_count = 4          # Number of parallel logical streams
+pacing_aggressiveness = 5 # 1-10 rate control
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 [logging]
 level = "info"

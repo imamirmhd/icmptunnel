@@ -60,6 +60,15 @@ step_size = 64
 [relay]
 enabled = false           # Enable to accept spoofed ICMP packets
 
+# ─── Transport Settings ──────────────────────────────────────────────────────
+[transport]
+window_size = 100         # Sliding window size (packets in flight)
+max_payload = 1400        # Maximum tunnel payload size
+retransmission_timeout = "200ms"
+compression = true        # LZ4-style streaming compression
+stream_count = 4          # Number of parallel logical streams
+pacing_aggressiveness = 5 # 1-10 rate control
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 [logging]
 level = "info"            # Options: debug, info, warn, error

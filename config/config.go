@@ -17,6 +17,7 @@ type ServerConfig struct {
 	Firewall   FirewallConfig   `toml:"firewall"`
 	Logging    LoggingConfig    `toml:"logging"`
 	Relay      RelayConfig      `toml:"relay"`
+	Transport  TransportConfig  `toml:"transport"`
 }
 
 // ClientConfig holds all client-side configuration.
@@ -30,6 +31,7 @@ type ClientConfig struct {
 	Forwards   []ForwardConfig  `toml:"forwards"`
 	Logging    LoggingConfig    `toml:"logging"`
 	Spoof      SpoofConfig      `toml:"spoof"`
+	Transport  TransportConfig  `toml:"transport"`
 }
 
 // RelayServerConfig holds relay server configuration.
@@ -48,6 +50,16 @@ type ICMPConfig struct {
 	WriteTimeout  string `toml:"write_timeout"`
 	SequenceStart int    `toml:"sequence_start"`
 	IDRange       [2]int `toml:"id_range"`
+}
+
+// TransportConfig holds transport layer settings.
+type TransportConfig struct {
+	WindowSize            int    `toml:"window_size"`
+	MaxPayload            int    `toml:"max_payload"`
+	RetransmissionTimeout string `toml:"retransmission_timeout"`
+	Compression           bool   `toml:"compression"`
+	StreamCount           int    `toml:"stream_count"`
+	PacingAggressiveness  int    `toml:"pacing_aggressiveness"`
 }
 
 // EncryptionConfig holds encryption settings.
@@ -153,6 +165,7 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		Evasion:  DefaultEvasionConfig(),
 		Firewall: DefaultFirewallConfig(),
 		Logging:  DefaultLoggingConfig(),
+		Transport: DefaultTransportConfig(),
 	}
 
 	data, err := os.ReadFile(path)
@@ -178,6 +191,7 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		Encryption: DefaultEncryptionConfig(),
 		Evasion:    DefaultEvasionConfig(),
 		Logging:    DefaultLoggingConfig(),
+		Transport:  DefaultTransportConfig(),
 	}
 
 	data, err := os.ReadFile(path)
@@ -252,3 +266,16 @@ func validateClientConfig(cfg *ClientConfig) error {
 	}
 	return nil
 }
+
+// DefaultTransportConfig returns default transport settings.
+func DefaultTransportConfig() TransportConfig {
+	return TransportConfig{
+		WindowSize:            100,
+		MaxPayload:            1400,
+		RetransmissionTimeout: "200ms",
+		Compression:           true,
+		StreamCount:           4,
+		PacingAggressiveness:  5,
+	}
+}
+

@@ -100,9 +100,10 @@ func (s *Server) Start() error {
 		s.enableIPForwarding()
 	}
 
-	// Start receive loop
-	s.wg.Add(1)
+	// Start loops
+	s.wg.Add(2)
 	go s.receiveLoop()
+	go s.retransmitLoop()
 
 	return nil
 }
@@ -266,34 +267,99 @@ func (s *Server) receiveLoop() {
 		tunnelPkt.ICMPID = icmpID
 		tunnelPkt.ICMPSeq = icmpSeq
 
+		// Decompression
+		if (tunnelPkt.Flags & icmp.FlagCompressed) != 0 {
+			session := s.sessionMgr.GetSession(tunnelPkt.SessionID)
+			if session != nil {
+				decomp, err := session.Decompress(tunnelPkt.Data)
+				if err == nil {
+					tunnelPkt.Data = decomp
+				}
+			}
+		}
+
 		s.handlePacket(realClientIP, srcIP, routeFlag, relayIP, tunnelPkt)
+	}
+}
+
+func (s *Server) retransmitLoop() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	sackTicker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	defer sackTicker.Stop()
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.sessionMgr.Iterate(func(session *icmp.Session) {
+				retrans := session.GetRetransmissions()
+				for _, p := range retrans {
+					s.log.Debug("Retransmitting packet %d to %s", p.SeqNum, session.ClientAddr)
+					s.sendResponse(session.ClientAddr, session.ClientAddr, icmp.RouteDirect, nil, 0, 0, p)
+				}
+			})
+		case <-sackTicker.C:
+			s.sessionMgr.Iterate(func(session *icmp.Session) {
+				if !session.Authenticated {
+					return
+				}
+				sack := session.GenerateSACK()
+				if len(sack.Blocks) > 0 || sack.AckedSeq != session.NextSeqRecv - 1 {
+					sackPkt := &icmp.TunnelPacket{
+						Type:      icmp.TypeControl,
+						SessionID: session.ID,
+						SeqNum:    session.GetNextSeq(),
+						Data:      icmp.EncodeSACK(sack),
+					}
+					s.sendResponse(session.ClientAddr, session.ClientAddr, icmp.RouteDirect, nil, 0, 0, sackPkt)
+				}
+			})
+		}
 	}
 }
 
 func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, pkt *icmp.TunnelPacket) {
 	s.log.Debug("Handling packet type %d, session %08x, seq %d, icmp_id %d", pkt.Type, pkt.SessionID, pkt.SeqNum, pkt.ICMPID)
 	switch pkt.Type {
-	case icmp.TypeAuth:
-		s.handleAuth(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, pkt)
-
-	case icmp.TypeDiag:
-		s.handleDiag(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, pkt)
-
-	case icmp.TypeData, icmp.TypeControl:
+	case icmp.TypeAuth, icmp.TypeDiag, icmp.TypeData, icmp.TypeControl:
 		session := s.sessionMgr.GetSession(pkt.SessionID)
-		if session == nil || !session.Authenticated {
+		if pkt.Type != icmp.TypeAuth && (session == nil || !session.Authenticated) {
 			s.log.Warn("Packet from unauthenticated session %08x", pkt.SessionID)
 			return
 		}
-		s.sessionMgr.TouchSession(pkt.SessionID)
 
 		// Reliability layer: sequencing and reordering
-		pkts := session.ProcessIncoming(pkt)
+		var pkts []*icmp.TunnelPacket
+		if session != nil {
+			pkts = session.ProcessIncoming(pkt)
+		} else {
+			pkts = []*icmp.TunnelPacket{pkt}
+		}
+
 		for _, p := range pkts {
-			if p.Type == icmp.TypeData {
+			switch p.Type {
+			case icmp.TypeAuth:
+				s.handleAuth(clientIP, srcIP, routeFlag, relayIP, p.ICMPID, p.ICMPSeq, p)
+			case icmp.TypeDiag:
+				s.handleDiag(clientIP, srcIP, routeFlag, relayIP, p.ICMPID, p.ICMPSeq, p)
+			case icmp.TypeData:
 				s.handleData(clientIP, srcIP, routeFlag, relayIP, p.ICMPID, p.ICMPSeq, session, p)
-			} else if p.Type == icmp.TypeControl {
+			case icmp.TypeControl:
 				s.handleControl(clientIP, srcIP, routeFlag, relayIP, p.ICMPID, p.ICMPSeq, session, p)
+			}
+		}
+
+		// Handle SACKs specifically
+		if pkt.Type == icmp.TypeControl {
+			subtype, _, _ := icmp.DecodeControlMessage(pkt.Data)
+			if subtype == icmp.ControlSACK {
+				sack, err := icmp.DecodeSACK(pkt.Data)
+				if err == nil {
+					session.ProcessACK(sack.AckedSeq, sack.Blocks)
+				}
 			}
 		}
 	}
@@ -308,6 +374,8 @@ func (s *Server) handleAuth(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 		session := s.sessionMgr.CreateSessionWithID(clientIP, pkt.SessionID)
 		session.Authenticated = true
 		session.AuthToken = token
+		session.MarkReceived(pkt.SeqNum)
+		session.ProcessIncoming(pkt)
 		responseSubtype = icmp.ControlAuthOK
 		s.log.Info("Authentication successful for %s", clientIP)
 	} else {
@@ -318,7 +386,7 @@ func (s *Server) handleAuth(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 	responsePkt := &icmp.TunnelPacket{
 		Type:      icmp.TypeControl,
 		SessionID: pkt.SessionID,
-		SeqNum:    0,
+		SeqNum:    0, // Auth still uses 0 for now as it's the very first packet
 		Data:      icmp.EncodeControlMessage(responseSubtype, 0),
 	}
 
@@ -406,11 +474,14 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 		ackPkt := &icmp.TunnelPacket{
 			Type:      icmp.TypeControl,
 			SessionID: session.ID,
+			SeqNum:    session.GetNextSeq(),
 			Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, req.StreamID),
 		}
+		session.RecordSent(ackPkt)
 		if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt); err != nil {
 			s.log.Error("Failed to send connect ACK: %v", err)
 		}
+		s.log.Info("Stream %d established to %s", req.StreamID, req.Destination)
 
 
 	// Start reading from destination and sending back
@@ -451,6 +522,9 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 			}
 
 			streamData := icmp.EncodeStreamData(req.StreamID, buf[:n])
+			
+			// We skip the direct sendResponse and use the session's aggregation/reliable logic
+			// But for now, let's keep it simple and just record it in session for retransmission
 			dataPkt := &icmp.TunnelPacket{
 				Type:      icmp.TypeData,
 				SessionID: session.ID,
@@ -458,16 +532,15 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 				Data:      streamData,
 			}
 
-			// Use same ID/Seq as request? No, async data sends need new ID/Seq?
-			// Actually, for unsolicited pushes (like data from destination), we are initiating the exchange.
-			// The original request ID/Seq are stale. We should generate new ones or use 0 to let socket randomize.
-			// Use 0, 0 to randomize.
+			session.RecordSent(dataPkt)
 			if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, 0, 0, dataPkt); err != nil {
 				s.log.Error("Send response to %s failed: %v", clientIP, err)
 				return
 			}
 		}
 	}()
+	case icmp.ControlSACK:
+		// Handled in handlePacket
 	case icmp.ControlClose:
 		connKey := fmt.Sprintf("%s:%d", clientIP, streamID)
 		s.connMu.Lock()
@@ -487,10 +560,11 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 	}
 
 	// Always send ACK for control messages except ACKs themselves
-	if subtype != icmp.ControlACK {
+	if subtype != icmp.ControlACK && session != nil {
 		ackPkt := &icmp.TunnelPacket{
 			Type:      icmp.TypeControl,
 			SessionID: session.ID,
+			SeqNum:    session.GetNextSeq(),
 			Data:      icmp.EncodeControlMessage(icmp.ControlACK, pkt.SeqNum),
 		}
 		s.sendResponse(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, ackPkt)

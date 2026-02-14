@@ -2,6 +2,7 @@
 package tunnel
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -38,6 +39,12 @@ type Client struct {
 	log                *logger.Logger
 	done               chan struct{}
 	wg                 sync.WaitGroup
+
+	// Aggregation & Pacing
+	aggMu     sync.Mutex
+	aggData   []byte
+	aggTimer  *time.Timer
+	maxAgg    int
 }
 
 // NewClient creates a new tunnel client.
@@ -95,6 +102,7 @@ func NewClient(cfg *config.ClientConfig) (*Client, error) {
 		pendingAcks:    make(map[uint16]chan struct{}),
 		log:            log,
 		done:       make(chan struct{}),
+		maxAgg:     cfg.ICMP.MaxPacketSize - 64, // Leave some room
 	}, nil
 }
 
@@ -137,9 +145,11 @@ func (c *Client) Start() error {
 		c.log.Info("Forwarder started: %s -> %s (%s)", fcfg.Listen, fcfg.Destination, fcfg.Protocol)
 	}
 
-	// Start heartbeat and health check loop
-	c.wg.Add(1)
+	// Start loops
+	c.wg.Add(3)
 	go c.heartbeatLoop()
+	go c.senderLoop()
+	go c.statsLoop()
 
 	return nil
 }
@@ -223,6 +233,8 @@ func (c *Client) authenticate() error {
 		if tunnelPkt.Type == icmp.TypeControl && tunnelPkt.SessionID == c.session.ID {
 			if len(tunnelPkt.Data) > 0 && tunnelPkt.Data[0] == icmp.ControlAuthOK {
 				c.session.Authenticated = true
+				c.session.MarkReceived(tunnelPkt.SeqNum) // Advance sequence
+				c.session.ProcessIncoming(tunnelPkt)   // Actually advance nextRecvSeq
 				return nil
 			}
 			if len(tunnelPkt.Data) > 0 && tunnelPkt.Data[0] == icmp.ControlAuthFail {
@@ -261,13 +273,13 @@ func (c *Client) handleConnect(protocol, destination string) (uint16, chan []byt
 		SeqNum:    c.session.GetNextSeq(),
 		Data:      controlData,
 	}
-
-	if err := c.sendTunnelPacket(pkt); err != nil {
+	// Send connect request to server reliably
+	if err := c.sendPacketReliable(pkt, 2*time.Second, 5); err != nil {
 		c.handleClose(streamID)
 		return 0, nil, err
 	}
 
-	// Wait for ACK
+	// Wait for ConnectACK (which carries status)
 	select {
 	case err := <-statusChan:
 		if err != nil {
@@ -278,21 +290,97 @@ func (c *Client) handleConnect(protocol, destination string) (uint16, chan []byt
 		return streamID, responseChan, nil
 	case <-time.After(10 * time.Second):
 		c.handleClose(streamID)
-		return 0, nil, fmt.Errorf("connect timeout")
+		return 0, nil, fmt.Errorf("connect timeout waiting for status")
 	}
 }
 
 func (c *Client) handleData(streamID uint16, data []byte) error {
-	streamData := icmp.EncodeStreamData(streamID, data)
+	c.aggMu.Lock()
+	defer c.aggMu.Unlock()
 
-	pkt := &icmp.TunnelPacket{
-		Type:      icmp.TypeData,
-		SessionID: c.session.ID,
-		SeqNum:    c.session.GetNextSeq(),
-		Data:      streamData,
+	c.aggData = append(c.aggData, icmp.EncodeStreamData(streamID, data)...)
+
+	if len(c.aggData) >= c.maxAgg {
+		c.flushAggBuffer()
+	} else if c.aggTimer == nil {
+		c.aggTimer = time.AfterFunc(2*time.Millisecond, func() {
+			c.aggMu.Lock()
+			c.flushAggBuffer()
+			c.aggMu.Unlock()
+		})
 	}
 
-	return c.sendTunnelPacket(pkt)
+	return nil
+}
+
+func (c *Client) flushAggBuffer() {
+	if len(c.aggData) == 0 {
+		return
+	}
+
+	if c.aggTimer != nil {
+		c.aggTimer.Stop()
+		c.aggTimer = nil
+	}
+
+	data := c.aggData
+	c.aggData = nil
+
+	// Compression
+	compressed := data
+	pktFlags := uint8(0)
+	if len(data) > 128 {
+		comp := c.session.Compress(data)
+		if len(comp) < len(data) {
+			compressed = comp
+			pktFlags |= icmp.FlagCompressed
+		}
+	}
+	
+	pkt := &icmp.TunnelPacket{
+		Type:      icmp.TypeData,
+		Flags:     pktFlags,
+		SessionID: c.session.ID,
+		SeqNum:    c.session.GetNextSeq(),
+		Data:      compressed,
+	}
+
+	c.session.RecordSent(pkt)
+	c.sendTunnelPacket(pkt)
+}
+
+func (c *Client) senderLoop() {
+	defer c.wg.Done()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			retrans := c.session.GetRetransmissions()
+			for _, p := range retrans {
+				c.log.Debug("Retransmitting packet %d", p.SeqNum)
+				c.sendTunnelPacket(p)
+			}
+		}
+	}
+}
+
+func (c *Client) statsLoop() {
+	defer c.wg.Done()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			// Log performance metrics
+		}
+	}
 }
 
 func (c *Client) handleClose(streamID uint16) {
@@ -305,6 +393,7 @@ func (c *Client) handleClose(streamID uint16) {
 		closePkt := &icmp.TunnelPacket{
 			Type:      icmp.TypeControl,
 			SessionID: c.session.ID,
+			SeqNum:    c.session.GetNextSeq(),
 			Data:      icmp.EncodeControlMessage(icmp.ControlClose, streamID),
 		}
 		c.sendPacketReliable(closePkt, 2*time.Second, 3)
@@ -456,6 +545,14 @@ func (c *Client) receiveLoop() {
 
 		c.lastServerActivity = time.Now()
 
+		// Decompression
+		if (tunnelPkt.Flags & icmp.FlagCompressed) != 0 {
+			decomp, err := c.session.Decompress(tunnelPkt.Data)
+			if err == nil {
+				tunnelPkt.Data = decomp
+			}
+		}
+
 		// Reliability layer: sequencing and reordering
 		pkts := c.session.ProcessIncoming(tunnelPkt)
 		for _, p := range pkts {
@@ -502,8 +599,11 @@ func (c *Client) receiveLoop() {
 					c.handleClose(streamID)
 
 				case icmp.ControlHeartbeat:
-					// Handled by update to LastActivity in ProcessIncoming/TouchSession
-
+					if len(p.Data) >= 9 {
+						sentAt := int64(binary.BigEndian.Uint64(p.Data[1:9]))
+						elapsed := time.Now().UnixNano() - sentAt
+						c.session.UpdateRTT(time.Duration(elapsed))
+					}
 				case icmp.ControlACK:
 					// For ControlACK, streamID field carries the original SeqNum being ACKed
 					c.pendingMu.Lock()
@@ -512,6 +612,12 @@ func (c *Client) receiveLoop() {
 						delete(c.pendingAcks, streamID)
 					}
 					c.pendingMu.Unlock()
+
+				case icmp.ControlSACK:
+					sack, err := icmp.DecodeSACK(p.Data)
+					if err == nil {
+						c.session.ProcessACK(sack.AckedSeq, sack.Blocks)
+					}
 				}
 			}
 		}
@@ -535,16 +641,33 @@ func (c *Client) heartbeatLoop() {
 		case <-c.done:
 			return
 		case <-ticker.C:
-			// Send heartbeat
+			// Send heartbeat with timestamp
+			now := time.Now().UnixNano()
+			ts := make([]byte, 8)
+			binary.BigEndian.PutUint64(ts, uint64(now))
+			
 			pkt := &icmp.TunnelPacket{
 				Type:      icmp.TypeControl,
 				SessionID: c.session.ID,
 				SeqNum:    c.session.GetNextSeq(),
-				Data:      icmp.EncodeControlMessage(icmp.ControlHeartbeat, 0),
+				Data:      append([]byte{icmp.ControlHeartbeat}, ts...),
 			}
 			if err := c.sendTunnelPacket(pkt); err != nil {
 				c.log.Error("Heartbeat send failed: %v", err)
 			}
+
+			// Send SACK
+			sack := c.session.GenerateSACK()
+			if len(sack.Blocks) > 0 || sack.AckedSeq != c.session.NextSeqRecv - 1 {
+				sackPkt := &icmp.TunnelPacket{
+					Type:      icmp.TypeControl,
+					SessionID: c.session.ID,
+					SeqNum:    c.session.GetNextSeq(),
+					Data:      icmp.EncodeSACK(sack),
+				}
+				c.sendTunnelPacket(sackPkt)
+			}
+
 
 			// Check for timeout
 			if time.Since(c.lastServerActivity) > 30*time.Second {

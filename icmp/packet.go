@@ -19,6 +19,7 @@ const (
 	FlagAuth      uint8 = 1 << 4
 	FlagSpoof     uint8 = 1 << 5
 	FlagFragment  uint8 = 1 << 2
+	FlagCompressed uint8 = 1 << 6
 )
 
 // Control subtypes.
@@ -31,6 +32,7 @@ const (
 	ControlConnectACK uint8 = 0x06
 	ControlConnectFail uint8 = 0x07
 	ControlACK        uint8 = 0x08
+	ControlSACK       uint8 = 0x09 // Selective ACK: confirm blocks and missing packets
 )
 
 // StreamDataHeader wraps stream data with a stream ID.

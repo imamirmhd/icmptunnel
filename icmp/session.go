@@ -8,6 +8,10 @@ import (
 	"net"
 	"sync"
 	"time"
+	"bytes"
+	"compress/flate"
+	"io"
+	"sort"
 
 	"github.com/user/icmptunnel/logger"
 )
@@ -25,7 +29,29 @@ type Session struct {
 	Streams       map[uint16]*Stream // Multiplexed streams within a session
 	recvBuf       map[uint16]*TunnelPacket
 	nextRecvSeq   uint16
+	
+	// Sliding Window & Congestion Control
 	mu            sync.Mutex
+	inflight      map[uint16]*inflightPacket
+	cwnd          int
+	ssthresh      int
+	srtt          time.Duration
+	rttvar        time.Duration
+	rto           time.Duration
+
+	// SACK state
+	receivedSeqs  map[uint16]bool
+}
+
+type inflightPacket struct {
+	Pkt      *TunnelPacket
+	SentAt   time.Time
+	Retries  int
+}
+
+type SACK struct {
+	AckedSeq uint16   // Highest in-order sequence received
+	Blocks   []uint16 // Ranges of out-of-order blocks: [start1, end1, start2, end2, ...]
 }
 
 // Stream represents a single TCP/UDP forwarding stream within a session.
@@ -74,6 +100,11 @@ func (sm *SessionManager) CreateSessionWithID(clientAddr net.IP, id uint32) *Ses
 		Streams:       make(map[uint16]*Stream),
 		recvBuf:       make(map[uint16]*TunnelPacket),
 		nextRecvSeq:   0,
+		inflight:      make(map[uint16]*inflightPacket),
+		cwnd:          10, // Initial window size
+		ssthresh:      64,
+		rto:           time.Second,
+		receivedSeqs:  make(map[uint16]bool),
 	}
 
 	sm.sessions[id] = session
@@ -135,11 +166,173 @@ func (s *Session) GetNextSeq() uint16 {
 	return seq
 }
 
+// RecordSent records a packet as being in-flight.
+func (s *Session) RecordSent(pkt *TunnelPacket) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inflight[pkt.SeqNum] = &inflightPacket{
+		Pkt:    pkt,
+		SentAt: time.Now(),
+	}
+}
+
+// ProcessACK handles an incoming ACK or SACK.
+// Returns a list of newly acknowledged packets.
+func (s *Session) ProcessACK(ackedSeq uint16, sackBlocks []uint16) []*TunnelPacket {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var acknowledged []*TunnelPacket
+
+	// Simple cumulative ACK
+	for seq, inflight := range s.inflight {
+		// seq <= ackedSeq (considering wraparound)
+		if (seq <= ackedSeq && ackedSeq - seq < 32768) || (seq > ackedSeq && seq - ackedSeq > 32768) {
+			acknowledged = append(acknowledged, inflight.Pkt)
+			s.UpdateRTT(time.Since(inflight.SentAt))
+			delete(s.inflight, seq)
+		}
+	}
+
+	// SACK blocks
+	for i := 0; i+1 < len(sackBlocks); i += 2 {
+		start := sackBlocks[i]
+		end := sackBlocks[i+1]
+		for seq := start; ; {
+			if inflight, ok := s.inflight[seq]; ok {
+				acknowledged = append(acknowledged, inflight.Pkt)
+				s.UpdateRTT(time.Since(inflight.SentAt))
+				delete(s.inflight, seq)
+			}
+			if seq == end {
+				break
+			}
+			seq++
+		}
+	}
+
+	// Update congestion window
+	if len(acknowledged) > 0 {
+		if s.cwnd < s.ssthresh {
+			s.cwnd += len(acknowledged) // Slow start
+		} else {
+			s.cwnd += 1 // Congestion avoidance
+		}
+	}
+
+	return acknowledged
+}
+
+func (s *Session) UpdateRTT(measured time.Duration) {
+	if s.srtt == 0 {
+		s.srtt = measured
+		s.rttvar = measured / 2
+	} else {
+		delta := measured - s.srtt
+		if delta < 0 {
+			delta = -delta
+		}
+		s.rttvar = time.Duration(0.75*float64(s.rttvar) + 0.25*float64(delta))
+		s.srtt = time.Duration(0.875*float64(s.srtt) + 0.125*float64(measured))
+	}
+	s.rto = s.srtt + 4*s.rttvar
+	if s.rto < 200*time.Millisecond {
+		s.rto = 200 * time.Millisecond
+	}
+}
+
+// GetRetransmissions returns packets that have timed out.
+func (s *Session) GetRetransmissions() []*TunnelPacket {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var retrans []*TunnelPacket
+	now := time.Now()
+	for _, inflight := range s.inflight {
+		if now.Sub(inflight.SentAt) > s.rto {
+			inflight.SentAt = now
+			inflight.Retries++
+			retrans = append(retrans, inflight.Pkt)
+		}
+	}
+
+	if len(retrans) > 0 {
+		// Congestion: back off
+		s.ssthresh = s.cwnd / 2
+		if s.ssthresh < 2 {
+			s.ssthresh = 2
+		}
+		s.cwnd = 1
+	}
+
+	return retrans
+}
+
+// GenerateSACK creates a SACK message based on received packets.
+func (s *Session) GenerateSACK() *SACK {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sack := &SACK{
+		AckedSeq: s.nextRecvSeq - 1,
+	}
+
+	var keys []int
+	for seq := range s.receivedSeqs {
+		if seq >= s.nextRecvSeq {
+			keys = append(keys, int(seq))
+		}
+	}
+	if len(keys) == 0 {
+		return sack
+	}
+	
+	// Sort keys
+	sort.Ints(keys)
+
+	start := uint16(keys[0])
+	end := uint16(keys[0])
+	for i := 1; i < len(keys); i++ {
+		if keys[i] == int(end)+1 {
+			end = uint16(keys[i])
+		} else {
+			sack.Blocks = append(sack.Blocks, start, end)
+			start = uint16(keys[i])
+			end = uint16(keys[i])
+			if len(sack.Blocks) >= 8 {
+				break
+			}
+		}
+	}
+	if len(sack.Blocks) < 8 {
+		sack.Blocks = append(sack.Blocks, start, end)
+	}
+
+	return sack
+}
+
+// MarkReceived records a sequence number as received.
+func (s *Session) MarkReceived(seq uint16) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.receivedSeqs[seq] = true
+	// Clean up old received seqs?
+	if len(s.receivedSeqs) > 2000 {
+		for k := range s.receivedSeqs {
+			if k < s.nextRecvSeq-500 {
+				delete(s.receivedSeqs, k)
+			}
+		}
+	}
+}
+
 // ProcessIncoming handles sequence numbers and reordering.
 // Returns a slice of packets that are now in-order and ready to be processed.
 func (s *Session) ProcessIncoming(pkt *TunnelPacket) []*TunnelPacket {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.receivedSeqs[pkt.SeqNum] = true
 
 	// If this is exactly what we expect
 	if pkt.SeqNum == s.nextRecvSeq {
@@ -165,8 +358,23 @@ func (s *Session) ProcessIncoming(pkt *TunnelPacket) []*TunnelPacket {
 		s.recvBuf[pkt.SeqNum] = pkt
 	}
 	
-	// If it's old (already processed), ignore it
 	return nil
+}
+
+// Compress applies flate compression to data.
+func (s *Session) Compress(data []byte) []byte {
+	var b bytes.Buffer
+	w, _ := flate.NewWriter(&b, flate.BestSpeed)
+	w.Write(data)
+	w.Close()
+	return b.Bytes()
+}
+
+// Decompress removes flate compression from data.
+func (s *Session) Decompress(data []byte) ([]byte, error) {
+	r := flate.NewReader(bytes.NewReader(data))
+	defer r.Close()
+	return io.ReadAll(r)
 }
 
 // AddStream adds a new data stream to the session.
@@ -195,6 +403,15 @@ func (s *Session) RemoveStream(id uint16) {
 	if stream, ok := s.Streams[id]; ok {
 		close(stream.Done)
 		delete(s.Streams, id)
+	}
+}
+
+// Iterate calls f for each active session.
+func (sm *SessionManager) Iterate(f func(*Session)) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for _, s := range sm.sessions {
+		f(s)
 	}
 }
 
@@ -309,4 +526,28 @@ func DecodeControlMessage(data []byte) (subtype uint8, streamID uint16, err erro
 		streamID = binary.BigEndian.Uint16(data[1:3])
 	}
 	return subtype, streamID, nil
+}
+// EncodeSACK serializes a SACK message.
+func EncodeSACK(s *SACK) []byte {
+	buf := make([]byte, 3 + len(s.Blocks)*2)
+	buf[0] = ControlSACK
+	binary.BigEndian.PutUint16(buf[1:3], s.AckedSeq)
+	for i, b := range s.Blocks {
+		binary.BigEndian.PutUint16(buf[3+i*2:5+i*2], b)
+	}
+	return buf
+}
+
+// DecodeSACK deserializes a SACK message.
+func DecodeSACK(data []byte) (*SACK, error) {
+	if len(data) < 3 {
+		return nil, fmt.Errorf("SACK too short")
+	}
+	s := &SACK{
+		AckedSeq: binary.BigEndian.Uint16(data[1:3]),
+	}
+	for i := 3; i+1 < len(data); i += 2 {
+		s.Blocks = append(s.Blocks, binary.BigEndian.Uint16(data[i:i+2]))
+	}
+	return s, nil
 }
