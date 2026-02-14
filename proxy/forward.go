@@ -22,6 +22,8 @@ type Forwarder struct {
 	log         *logger.Logger
 	wg          sync.WaitGroup
 	done        chan struct{}
+	conns       map[net.Conn]struct{}
+	connsMu     sync.Mutex
 }
 
 // NewForwarder creates a new port forwarder.
@@ -37,6 +39,7 @@ func NewForwarder(listen, destination, protocol string, maxDataSize int,
 		maxDataSize: maxDataSize,
 		log:         logger.Default().WithComponent("forward"),
 		done:        make(chan struct{}),
+		conns:       make(map[net.Conn]struct{}),
 	}
 }
 
@@ -58,6 +61,13 @@ func (f *Forwarder) Stop() {
 	if f.listener != nil {
 		f.listener.Close()
 	}
+	
+	f.connsMu.Lock()
+	for conn := range f.conns {
+		conn.Close()
+	}
+	f.connsMu.Unlock()
+
 	if f.udpConn != nil {
 		f.udpConn.Close()
 	}
@@ -99,20 +109,36 @@ func (f *Forwarder) startTCP() error {
 }
 
 func (f *Forwarder) handleTCPConn(conn net.Conn) {
-	defer conn.Close()
+	f.connsMu.Lock()
+	f.conns[conn] = struct{}{}
+	f.connsMu.Unlock()
+
+	defer func() {
+		conn.Close()
+		f.connsMu.Lock()
+		delete(f.conns, conn)
+		f.connsMu.Unlock()
+	}()
 
 	streamID, responseChan, err := f.onConnect("tcp", f.destination)
 	if err != nil {
-		f.log.Error("Connect failed: %v", err)
+		select {
+		case <-f.done:
+			return
+		default:
+			f.log.Error("Connect failed: %v", err)
+		}
 		return
 	}
 	defer f.onClose(streamID)
 
-	doneCh := make(chan struct{}, 2)
+	// Step 5: Bidirectional data relay
+	var relayWg sync.WaitGroup
+	relayWg.Add(2)
 
 	// Local -> Tunnel
 	go func() {
-		defer func() { doneCh <- struct{}{} }()
+		defer relayWg.Done()
 		bufSize := f.maxDataSize
 		if bufSize <= 0 {
 			bufSize = 32 * 1024
@@ -131,7 +157,7 @@ func (f *Forwarder) handleTCPConn(conn net.Conn) {
 
 	// Tunnel -> Local
 	go func() {
-		defer func() { doneCh <- struct{}{} }()
+		defer relayWg.Done()
 		for {
 			select {
 			case data, ok := <-responseChan:
@@ -147,7 +173,7 @@ func (f *Forwarder) handleTCPConn(conn net.Conn) {
 		}
 	}()
 
-	<-doneCh
+	relayWg.Wait()
 }
 
 func (f *Forwarder) startUDP() error {

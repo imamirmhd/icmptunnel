@@ -1,0 +1,23 @@
+# AES-256-GCM encrypted client config
+server_addr = "127.0.0.1"
+auth_token = "test-token-12345"
+
+[[socks5]]
+listen = "127.0.0.1:1080"
+
+[icmp]
+max_packet_size = 1472
+read_timeout = "5s"
+write_timeout = "5s"
+
+[encryption]
+enabled = true
+method = "aes-256-gcm"
+key = "33c04c5cda9f9135a1511c4bb73393992d69873eeb1570784dea14bb01383636"
+
+[transport]
+window_size = 100
+
+[logging]
+level = "error"
+output = "stdout"

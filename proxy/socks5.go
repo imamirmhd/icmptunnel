@@ -127,22 +127,29 @@ func (s *Socks5Server) handleConnection(conn net.Conn) {
 	s.sendReply(conn, 0x00) // Succeeded
 
 	// Step 5: Bidirectional data relay
-	doneCh := make(chan struct{}, 2)
+	var relayWg sync.WaitGroup
+	relayWg.Add(2)
 
 	// Client -> Tunnel
 	go func() {
-		defer func() { doneCh <- struct{}{} }()
+		defer relayWg.Done()
 		bufSize := s.maxDataSize
 		if bufSize <= 0 {
 			bufSize = 32 * 1024
 		}
 		buf := make([]byte, bufSize)
+		s.log.Debug("Starting Client->Tunnel loop for stream %d", streamID)
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
+				if err != io.EOF {
+					s.log.Debug("Read error from client: %v", err)
+				}
 				return
 			}
+			s.log.Info("Read %d bytes from client (Stream %d)", n, streamID)
 			if err := s.onData(streamID, buf[:n]); err != nil {
+				s.log.Error("onData error for stream %d: %v", streamID, err)
 				return
 			}
 		}
@@ -150,14 +157,17 @@ func (s *Socks5Server) handleConnection(conn net.Conn) {
 
 	// Tunnel -> Client
 	go func() {
-		defer func() { doneCh <- struct{}{} }()
+		defer relayWg.Done()
 		for {
 			select {
 			case data, ok := <-responseChan:
 				if !ok {
+					s.log.Debug("responseChan closed for Stream %d", streamID)
 					return
 				}
+				s.log.Debug("Writing %d bytes to client (Stream %d)", len(data), streamID)
 				if _, err := conn.Write(data); err != nil {
+					s.log.Debug("Write error to client: %v", err)
 					return
 				}
 			case <-s.done:
@@ -166,7 +176,7 @@ func (s *Socks5Server) handleConnection(conn net.Conn) {
 		}
 	}()
 
-	<-doneCh
+	relayWg.Wait()
 }
 
 func (s *Socks5Server) negotiateAuth(conn net.Conn) error {
@@ -285,7 +295,7 @@ func (s *Socks5Server) readRequest(conn net.Conn) (string, error) {
 	}
 	port := binary.BigEndian.Uint16(portBuf)
 
-	return fmt.Sprintf("%s:%d", host, port), nil
+	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
 }
 
 func (s *Socks5Server) sendReply(conn net.Conn, status byte) {

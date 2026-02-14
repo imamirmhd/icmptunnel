@@ -35,26 +35,64 @@ const (
 	ControlSACK       uint8 = 0x09 // Selective ACK: confirm blocks and missing packets
 )
 
-// StreamDataHeader wraps stream data with a stream ID.
-// Wire format: [2B stream_id][NB data]
-const StreamDataHeaderSize = 2
+// StreamDataHeader wraps stream data with a stream ID and length.
+// Wire format: [2B stream_id][2B data_len][NB data]
+const StreamDataHeaderSize = 4
 
-// EncodeStreamData wraps data with a stream ID for multiplexing.
+// EncodeStreamData wraps data with a stream ID and length for multiplexing.
+// Multiple entries can be safely concatenated and decoded with DecodeAllStreamData.
 func EncodeStreamData(streamID uint16, data []byte) []byte {
 	buf := make([]byte, StreamDataHeaderSize+len(data))
 	binary.BigEndian.PutUint16(buf[0:2], streamID)
-	copy(buf[2:], data)
+	binary.BigEndian.PutUint16(buf[2:4], uint16(len(data)))
+	copy(buf[4:], data)
 	return buf
 }
 
-// DecodeStreamData extracts the stream ID and data.
+// DecodeStreamData extracts the first stream ID and data from a payload.
+// For payloads with multiple concatenated stream entries, use DecodeAllStreamData.
 func DecodeStreamData(payload []byte) (streamID uint16, data []byte, err error) {
 	if len(payload) < StreamDataHeaderSize {
 		return 0, nil, fmt.Errorf("stream data too short")
 	}
 	streamID = binary.BigEndian.Uint16(payload[0:2])
-	data = payload[2:]
+	dataLen := int(binary.BigEndian.Uint16(payload[2:4]))
+	if StreamDataHeaderSize+dataLen > len(payload) {
+		return 0, nil, fmt.Errorf("stream data length %d exceeds payload size %d", dataLen, len(payload)-StreamDataHeaderSize)
+	}
+	data = payload[StreamDataHeaderSize : StreamDataHeaderSize+dataLen]
 	return streamID, data, nil
+}
+
+// StreamEntry represents a single stream data entry in an aggregated packet.
+type StreamEntry struct {
+	StreamID uint16
+	Data     []byte
+}
+
+// DecodeAllStreamData decodes all concatenated stream entries from an aggregated payload.
+func DecodeAllStreamData(payload []byte) ([]StreamEntry, error) {
+	var entries []StreamEntry
+	offset := 0
+	for offset < len(payload) {
+		if offset+StreamDataHeaderSize > len(payload) {
+			return nil, fmt.Errorf("truncated stream header at offset %d", offset)
+		}
+		streamID := binary.BigEndian.Uint16(payload[offset : offset+2])
+		dataLen := int(binary.BigEndian.Uint16(payload[offset+2 : offset+4]))
+		offset += StreamDataHeaderSize
+		if offset+dataLen > len(payload) {
+			return nil, fmt.Errorf("stream data length %d exceeds remaining payload at offset %d", dataLen, offset)
+		}
+		entry := StreamEntry{
+			StreamID: streamID,
+			Data:     make([]byte, dataLen),
+		}
+		copy(entry.Data, payload[offset:offset+dataLen])
+		entries = append(entries, entry)
+		offset += dataLen
+	}
+	return entries, nil
 }
 
 // TunnelHeaderSize is the size of the tunnel packet header.

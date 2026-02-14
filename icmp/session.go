@@ -28,10 +28,16 @@ type Session struct {
 	LastActivity  time.Time
 	Streams       map[uint16]*Stream // Multiplexed streams within a session
 	recvBuf       map[uint16]*TunnelPacket
-	nextRecvSeq   uint16
+	NextRecvSeq   uint16
+	
+	// NAT tracking
+	LastICMPID      uint16
+	LastICMPSeq     uint16
+	OutboundICMPID  uint16
+	OutboundICMPSeq uint16
 	
 	// Sliding Window & Congestion Control
-	mu            sync.Mutex
+	Mu            sync.RWMutex
 	inflight      map[uint16]*inflightPacket
 	cwnd          int
 	ssthresh      int
@@ -99,12 +105,14 @@ func (sm *SessionManager) CreateSessionWithID(clientAddr net.IP, id uint32) *Ses
 		LastActivity:  now,
 		Streams:       make(map[uint16]*Stream),
 		recvBuf:       make(map[uint16]*TunnelPacket),
-		nextRecvSeq:   0,
+		NextRecvSeq:   0,
 		inflight:      make(map[uint16]*inflightPacket),
 		cwnd:          10, // Initial window size
 		ssthresh:      64,
 		rto:           time.Second,
 		receivedSeqs:  make(map[uint16]bool),
+		OutboundICMPID: uint16(generateSessionID() & 0xFFFF),
+		OutboundICMPSeq: 0,
 	}
 
 	sm.sessions[id] = session
@@ -151,16 +159,16 @@ func (sm *SessionManager) TouchSession(id uint32) {
 	defer sm.mu.RUnlock()
 
 	if session, ok := sm.sessions[id]; ok {
-		session.mu.Lock()
+		session.Mu.Lock()
 		session.LastActivity = time.Now()
-		session.mu.Unlock()
+		session.Mu.Unlock()
 	}
 }
 
 // GetNextSeq returns and increments the send sequence number.
 func (s *Session) GetNextSeq() uint16 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	seq := s.NextSeqSend
 	s.NextSeqSend++
 	return seq
@@ -168,8 +176,8 @@ func (s *Session) GetNextSeq() uint16 {
 
 // RecordSent records a packet as being in-flight.
 func (s *Session) RecordSent(pkt *TunnelPacket) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	s.inflight[pkt.SeqNum] = &inflightPacket{
 		Pkt:    pkt,
 		SentAt: time.Now(),
@@ -179,8 +187,8 @@ func (s *Session) RecordSent(pkt *TunnelPacket) {
 // ProcessACK handles an incoming ACK or SACK.
 // Returns a list of newly acknowledged packets.
 func (s *Session) ProcessACK(ackedSeq uint16, sackBlocks []uint16) []*TunnelPacket {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 
 	var acknowledged []*TunnelPacket
 
@@ -243,8 +251,8 @@ func (s *Session) UpdateRTT(measured time.Duration) {
 
 // GetRetransmissions returns packets that have timed out.
 func (s *Session) GetRetransmissions() []*TunnelPacket {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 
 	var retrans []*TunnelPacket
 	now := time.Now()
@@ -257,12 +265,13 @@ func (s *Session) GetRetransmissions() []*TunnelPacket {
 	}
 
 	if len(retrans) > 0 {
-		// Congestion: back off
+		// Congestion: back off, but don't be too aggressive for ICMP
 		s.ssthresh = s.cwnd / 2
-		if s.ssthresh < 2 {
-			s.ssthresh = 2
+		if s.ssthresh < 5 {
+			s.ssthresh = 5
 		}
-		s.cwnd = 1
+		// Instead of 1, drop to ssthresh or at least 5
+		s.cwnd = s.ssthresh
 	}
 
 	return retrans
@@ -270,16 +279,16 @@ func (s *Session) GetRetransmissions() []*TunnelPacket {
 
 // GenerateSACK creates a SACK message based on received packets.
 func (s *Session) GenerateSACK() *SACK {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 
 	sack := &SACK{
-		AckedSeq: s.nextRecvSeq - 1,
+		AckedSeq: s.NextRecvSeq - 1,
 	}
 
 	var keys []int
 	for seq := range s.receivedSeqs {
-		if seq >= s.nextRecvSeq {
+		if seq >= s.NextRecvSeq {
 			keys = append(keys, int(seq))
 		}
 	}
@@ -313,38 +322,80 @@ func (s *Session) GenerateSACK() *SACK {
 
 // MarkReceived records a sequence number as received.
 func (s *Session) MarkReceived(seq uint16) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	s.receivedSeqs[seq] = true
-	// Clean up old received seqs?
+	
+	// Clean up old received seqs (keep ~1000 history)
 	if len(s.receivedSeqs) > 2000 {
 		for k := range s.receivedSeqs {
-			if k < s.nextRecvSeq-500 {
+			if s.isOlder(k, s.NextRecvSeq, 1000) {
 				delete(s.receivedSeqs, k)
 			}
 		}
 	}
 }
 
+// isOlder returns true if seq is older than base by more than threshold, considering wraparound.
+func (s *Session) isOlder(seq, base uint16, threshold uint16) bool {
+	// diff = base - seq
+	diff := base - seq
+	return diff > threshold && diff < 32768
+}
+
+// IsDuplicate returns true if the sequence number has already been processed or is currently buffered.
+func (s *Session) IsDuplicate(seq uint16) bool {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	
+	if _, ok := s.recvBuf[seq]; ok {
+		return true
+	}
+	
+	// Check if seq is older than NextRecvSeq using signed arithmetic
+	// to handle uint16 wraparound correctly.
+	// A positive signed diff means seq is behind NextRecvSeq (i.e., already processed).
+	diff := int16(s.NextRecvSeq - seq)
+	if diff > 0 {
+		return true
+	}
+	
+	return false
+}
+
+// GetNextICMPSeq returns and increments the outbound ICMP sequence number.
+func (s *Session) GetNextICMPSeq() uint16 {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	seq := s.OutboundICMPSeq
+	s.OutboundICMPSeq++
+	return seq
+}
+
 // ProcessIncoming handles sequence numbers and reordering.
 // Returns a slice of packets that are now in-order and ready to be processed.
 func (s *Session) ProcessIncoming(pkt *TunnelPacket) []*TunnelPacket {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 
+	s.LastICMPID = pkt.ICMPID
+	s.LastICMPSeq = pkt.ICMPSeq
 	s.receivedSeqs[pkt.SeqNum] = true
 
 	// If this is exactly what we expect
-	if pkt.SeqNum == s.nextRecvSeq {
-		s.nextRecvSeq++
+	if pkt.SeqNum == s.NextRecvSeq {
+		s.NextRecvSeq++
 		result := []*TunnelPacket{pkt}
 
 		// Check buffer for subsequent packets
 		for {
-			if nextPkt, ok := s.recvBuf[s.nextRecvSeq]; ok {
+			if nextPkt, ok := s.recvBuf[s.NextRecvSeq]; ok {
+				// Re-stamp buffered packets with triggering ID/Seq
+				nextPkt.ICMPID = pkt.ICMPID
+				nextPkt.ICMPSeq = pkt.ICMPSeq
 				result = append(result, nextPkt)
-				delete(s.recvBuf, s.nextRecvSeq)
-				s.nextRecvSeq++
+				delete(s.recvBuf, s.NextRecvSeq)
+				s.NextRecvSeq++
 			} else {
 				break
 			}
@@ -353,7 +404,7 @@ func (s *Session) ProcessIncoming(pkt *TunnelPacket) []*TunnelPacket {
 	}
 
 	// Out of order: buffer it if it's not too far ahead
-	diff := pkt.SeqNum - s.nextRecvSeq
+	diff := pkt.SeqNum - s.NextRecvSeq
 	if diff < 1000 { // Max 1000 packets ahead
 		s.recvBuf[pkt.SeqNum] = pkt
 	}
@@ -379,15 +430,32 @@ func (s *Session) Decompress(data []byte) ([]byte, error) {
 
 // AddStream adds a new data stream to the session.
 func (s *Session) AddStream(protocol, destination string) *Stream {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 
 	id := uint16(len(s.Streams) + 1)
 	stream := &Stream{
 		ID:          id,
 		Protocol:    protocol,
 		Destination: destination,
-		DataChan:    make(chan []byte, 256),
+		DataChan:    make(chan []byte, 1024),
+		Done:        make(chan struct{}),
+		CreatedAt:   time.Now(),
+	}
+	s.Streams[id] = stream
+	return stream
+}
+
+// AddStreamWithID adds a new data stream to the session with a specific ID.
+func (s *Session) AddStreamWithID(id uint16, protocol, destination string) *Stream {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	stream := &Stream{
+		ID:          id,
+		Protocol:    protocol,
+		Destination: destination,
+		DataChan:    make(chan []byte, 1024),
 		Done:        make(chan struct{}),
 		CreatedAt:   time.Now(),
 	}
@@ -397,8 +465,8 @@ func (s *Session) AddStream(protocol, destination string) *Stream {
 
 // RemoveStream removes a stream from the session.
 func (s *Session) RemoveStream(id uint16) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 
 	if stream, ok := s.Streams[id]; ok {
 		close(stream.Done)
@@ -424,13 +492,13 @@ func (sm *SessionManager) cleanupLoop() {
 		sm.mu.Lock()
 		now := time.Now()
 		for id, session := range sm.sessions {
-			session.mu.Lock()
+			session.Mu.Lock()
 			if now.Sub(session.LastActivity) > sm.timeout {
 				sm.log.Info("Session %08x timed out (idle %v)", id, now.Sub(session.LastActivity))
 				delete(sm.sessionsByAddr, session.ClientAddr.String())
 				delete(sm.sessions, id)
 			}
-			session.mu.Unlock()
+			session.Mu.Unlock()
 		}
 		sm.mu.Unlock()
 	}
@@ -529,13 +597,23 @@ func DecodeControlMessage(data []byte) (subtype uint8, streamID uint16, err erro
 }
 // EncodeSACK serializes a SACK message.
 func EncodeSACK(s *SACK) []byte {
-	buf := make([]byte, 3 + len(s.Blocks)*2)
+	buf := make([]byte, 3+len(s.Blocks)*2)
 	buf[0] = ControlSACK
 	binary.BigEndian.PutUint16(buf[1:3], s.AckedSeq)
 	for i, b := range s.Blocks {
-		binary.BigEndian.PutUint16(buf[3+i*2:5+i*2], b)
+		binary.BigEndian.PutUint16(buf[3+i*2:3+i*2+2], b)
 	}
 	return buf
+}
+
+// EncodePacket wraps a SACK in a TunnelPacket.
+func (s *SACK) EncodePacket(sessionID uint32) *TunnelPacket {
+	return &TunnelPacket{
+		Type:      TypeControl,
+		SessionID: sessionID,
+		SeqNum:    0, // SACKs are not reliable themselves (sent frequently)
+		Data:      EncodeSACK(s),
+	}
 }
 
 // DecodeSACK deserializes a SACK message.

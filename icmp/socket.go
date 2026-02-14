@@ -87,9 +87,13 @@ func (s *Socket) Send(srcIP, destIP net.IP, icmpType uint8, id, seq uint16, payl
 	binary.BigEndian.PutUint16(packet[6:8], 0)                 // Flags + Fragment offset
 	packet[8] = byte(s.ttl)                                    // TTL
 	packet[9] = syscall.IPPROTO_ICMP                           // Protocol
-	binary.BigEndian.PutUint16(packet[10:12], 0)               // Checksum (kernel fills)
+	binary.BigEndian.PutUint16(packet[10:12], 0)               // Checksum placeholder
 	copy(packet[12:16], src4)                                  // Source IP
 	copy(packet[16:20], dst4)                                  // Dest IP
+
+	// Calculate and fill IP checksum
+	ipCksum := Checksum(packet[:20])
+	binary.BigEndian.PutUint16(packet[10:12], ipCksum)
 
 	// ICMP Header (8 bytes)
 	packet[20] = icmpType  // Type
@@ -207,6 +211,6 @@ func Checksum(data []byte) uint16 {
 
 // randID generates a random 16-bit ID.
 func randID() uint16 {
-	// Use a simple counter-based approach for better performance.
-	return uint16(time.Now().UnixNano() & 0xFFFF)
+	now := time.Now().UnixNano()
+	return uint16(now ^ (now >> 16) ^ (now >> 32))
 }

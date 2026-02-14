@@ -1,0 +1,25 @@
+# Fragmented client config
+server_addr = "127.0.0.1"
+auth_token = "test-token-12345"
+
+[[socks5]]
+listen = "127.0.0.1:1082"
+
+[icmp]
+max_packet_size = 1472
+read_timeout = "5s"
+write_timeout = "5s"
+
+[encryption]
+enabled = false
+
+[transport]
+window_size = 100
+
+[evasion.fragmentation]
+enabled = true
+max_fragment_size = 100
+
+[logging]
+level = "error"
+output = "stdout"

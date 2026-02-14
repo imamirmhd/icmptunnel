@@ -62,9 +62,16 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// Wait for signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+	sig := <-sigCh
+	fmt.Printf("\nReceived %v, shutting down...\n", sig)
 
-	fmt.Println("\nShutting down...")
+	// Listen for a second signal for force exit
+	go func() {
+		sig2 := <-sigCh
+		fmt.Printf("\nReceived %v again, force exiting...\n", sig2)
+		os.Exit(1)
+	}()
+
 	srv.Stop()
 	return nil
 }

@@ -2,7 +2,7 @@ icmptunnel
 *.log
 *.exe
 bin/
-test/
+# test/ removed to allow tracking test suite
 test/local_*.toml
 .agent/
 .system_generated/

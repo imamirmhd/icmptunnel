@@ -53,6 +53,13 @@ func runClient(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	if logLevel != "info" || cfg.Logging.Level == "" {
+		cfg.Logging.Level = logLevel
+	}
+	if verbose {
+		cfg.Logging.Level = "debug"
+	}
+
 	client, err := tunnel.NewClient(cfg)
 	if err != nil {
 		return err
@@ -65,9 +72,16 @@ func runClient(cmd *cobra.Command, args []string) error {
 	// Wait for signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+	sig := <-sigCh
+	fmt.Printf("\nReceived %v, shutting down...\n", sig)
 
-	fmt.Println("\nShutting down...")
+	// Listen for a second signal for force exit
+	go func() {
+		sig2 := <-sigCh
+		fmt.Printf("\nReceived %v again, force exiting...\n", sig2)
+		os.Exit(1)
+	}()
+
 	client.Stop()
 	return nil
 }

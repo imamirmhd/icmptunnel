@@ -1,0 +1,27 @@
+# Port forwarding client config (loopback)
+server_addr = "127.0.0.1"
+auth_token = "test-token-12345"
+
+[[socks5]]
+listen = "127.0.0.1:1080"
+
+# TCP port forward: local:8080 -> httpbin.org:80
+[[forwards]]
+protocol = "tcp"
+listen = "127.0.0.1:8080"
+destination = "httpbin.org:80"
+
+[icmp]
+max_packet_size = 1472
+read_timeout = "5s"
+write_timeout = "5s"
+
+[encryption]
+enabled = false
+
+[transport]
+window_size = 100
+
+[logging]
+level = "error"
+output = "stdout"

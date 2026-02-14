@@ -15,6 +15,7 @@ import (
 	"github.com/user/icmptunnel/evasion"
 	"github.com/user/icmptunnel/icmp"
 	"github.com/user/icmptunnel/logger"
+	"strings"
 )
 
 // Server manages the server side of the ICMP tunnel.
@@ -132,8 +133,7 @@ func (s *Server) Stop() {
 
 // Wait blocks until the server is stopped.
 func (s *Server) Wait() {
-	c := make(chan struct{})
-	<-c // Block forever until Stop is called
+	s.wg.Wait()
 }
 
 func (s *Server) receiveLoop() {
@@ -150,9 +150,17 @@ func (s *Server) receiveLoop() {
 
 		srcIP, icmpType, icmpID, icmpSeq, rawPayload, err := s.socket.Receive()
 		if err != nil {
+			select {
+			case <-s.done:
+				return
+			default:
+			}
 			// Don't log timeouts to avoid spam, unless we want to debug headers
 			if err.Error() != "receiving: resource temporarily unavailable" {
 				s.log.Debug("Receive error: %v", err)
+			}
+			if strings.Contains(err.Error(), "closed") || strings.Contains(err.Error(), "bad file descriptor") {
+				return
 			}
 			continue
 		}
@@ -284,8 +292,8 @@ func (s *Server) receiveLoop() {
 
 func (s *Server) retransmitLoop() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	sackTicker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(200 * time.Millisecond) // Retransmission check
+	sackTicker := time.NewTicker(1 * time.Second)    // SACK generation
 	defer ticker.Stop()
 	defer sackTicker.Stop()
 
@@ -298,23 +306,14 @@ func (s *Server) retransmitLoop() {
 				retrans := session.GetRetransmissions()
 				for _, p := range retrans {
 					s.log.Debug("Retransmitting packet %d to %s", p.SeqNum, session.ClientAddr)
-					s.sendResponse(session.ClientAddr, session.ClientAddr, icmp.RouteDirect, nil, 0, 0, p)
+					s.sendResponse(session.ClientAddr, session.ClientAddr, icmp.RouteDirect, nil, session.LastICMPID, session.LastICMPSeq, p)
 				}
 			})
 		case <-sackTicker.C:
 			s.sessionMgr.Iterate(func(session *icmp.Session) {
-				if !session.Authenticated {
-					return
-				}
-				sack := session.GenerateSACK()
-				if len(sack.Blocks) > 0 || sack.AckedSeq != session.NextSeqRecv - 1 {
-					sackPkt := &icmp.TunnelPacket{
-						Type:      icmp.TypeControl,
-						SessionID: session.ID,
-						SeqNum:    session.GetNextSeq(),
-						Data:      icmp.EncodeSACK(sack),
-					}
-					s.sendResponse(session.ClientAddr, session.ClientAddr, icmp.RouteDirect, nil, 0, 0, sackPkt)
+				if session.Authenticated {
+					sackPkt := session.GenerateSACK().EncodePacket(session.ID)
+					s.sendResponse(session.ClientAddr, session.ClientAddr, icmp.RouteDirect, nil, session.LastICMPID, session.LastICMPSeq, sackPkt)
 				}
 			})
 		}
@@ -348,6 +347,11 @@ func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 		var pkts []*icmp.TunnelPacket
 		if session != nil {
 			pkts = session.ProcessIncoming(pkt)
+			if pkts == nil && session.IsDuplicate(pkt.SeqNum) && pkt.Type == icmp.TypeControl {
+				s.log.Debug("Re-acknowledging duplicate control packet %d", pkt.SeqNum)
+				s.handleControl(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, session, pkt)
+				return
+			}
 		} else {
 			pkts = []*icmp.TunnelPacket{pkt}
 		}
@@ -364,16 +368,9 @@ func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 				s.handleControl(clientIP, srcIP, routeFlag, relayIP, p.ICMPID, p.ICMPSeq, session, p)
 			}
 		}
-
-		// Handle SACKs specifically
-		if pkt.Type == icmp.TypeControl {
-			subtype, _, _ := icmp.DecodeControlMessage(pkt.Data)
-			if subtype == icmp.ControlSACK {
-				sack, err := icmp.DecodeSACK(pkt.Data)
-				if err == nil {
-					session.ProcessACK(sack.AckedSeq, sack.Blocks)
-				}
-			}
+		
+		if session != nil {
+			s.sessionMgr.TouchSession(pkt.SessionID)
 		}
 	}
 }
@@ -383,75 +380,118 @@ func (s *Server) handleAuth(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 	s.log.Info("Auth request from %s (session %08x)", clientIP, pkt.SessionID)
 
 	var responseSubtype uint8
+	session := s.sessionMgr.GetSession(pkt.SessionID)
 	if s.authValidator.IsValid(token) {
-		session := s.sessionMgr.CreateSessionWithID(clientIP, pkt.SessionID)
-		session.Authenticated = true
-		session.AuthToken = token
-		session.MarkReceived(pkt.SeqNum)
-		session.ProcessIncoming(pkt)
+		if session != nil && session.Authenticated && session.AuthToken == token {
+			s.log.Debug("Re-authenticating existing session %08x", pkt.SessionID)
+		} else {
+			session = s.sessionMgr.CreateSessionWithID(clientIP, pkt.SessionID)
+			session.Authenticated = true
+			session.AuthToken = token
+			// Initialize NextRecvSeq to expect the next packet after this Auth packet
+			session.NextRecvSeq = pkt.SeqNum + 1
+			s.log.Info("Authentication successful for %s (session %08x), NextRecvSeq=%d", clientIP, pkt.SessionID, session.NextRecvSeq)
+		}
 		responseSubtype = icmp.ControlAuthOK
-		s.log.Info("Authentication successful for %s", clientIP)
 	} else {
 		responseSubtype = icmp.ControlAuthFail
 		s.log.Warn("Authentication failed for %s", clientIP)
 	}
 
+	var seqNum uint16
+	if session != nil {
+		seqNum = session.GetNextSeq()
+	}
+
 	responsePkt := &icmp.TunnelPacket{
 		Type:      icmp.TypeControl,
 		SessionID: pkt.SessionID,
-		SeqNum:    0, // Auth still uses 0 for now as it's the very first packet
+		SeqNum:    seqNum,
 		Data:      icmp.EncodeControlMessage(responseSubtype, 0),
 	}
 
 	if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, responsePkt); err != nil {
 		s.log.Error("Failed to send auth response: %v", err)
+	} else if session != nil {
+		session.RecordSent(responsePkt)
 	}
 }
 
 func (s *Server) handleData(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, icmpID, icmpSeq uint16, session *icmp.Session, pkt *icmp.TunnelPacket) {
-	streamID, data, err := icmp.DecodeStreamData(pkt.Data)
+	// Decode all stream entries from the aggregated payload
+	entries, err := icmp.DecodeAllStreamData(pkt.Data)
 	if err != nil {
 		s.log.Error("Decode stream data: %v", err)
 		return
 	}
 
-	connKey := fmt.Sprintf("%s:%d", clientIP, streamID)
+	for _, entry := range entries {
+		session.Mu.RLock()
+		stream, streamExists := session.Streams[entry.StreamID]
+		session.Mu.RUnlock()
 
-	s.connMu.RLock()
-	conn, exists := s.connections[connKey]
-	s.connMu.RUnlock()
+		if !streamExists {
+			s.log.Warn("Data for unknown stream %d in session %08x", entry.StreamID, session.ID)
+			continue
+		}
 
-	if !exists {
-		s.log.Warn("Data for unknown stream %s", connKey)
-		return
+		// Buffer full - non-blocking send logic:
+		select {
+		case stream.DataChan <- entry.Data:
+		default:
+			// Drop if full to avoid blocking dispatcher
+		}
 	}
 
-	if _, err := conn.Write(data); err != nil {
-		s.log.Error("Write to destination: %v", err)
-		s.connMu.Lock()
-		conn.Close()
-		delete(s.connections, connKey)
-		s.connMu.Unlock()
+	// Immediate ACK to stop client retransmissions
+	ackPkt := &icmp.TunnelPacket{
+		Type:      icmp.TypeControl,
+		SessionID: session.ID,
+		SeqNum:    session.GetNextSeq(),
+		Data:      icmp.EncodeControlMessage(icmp.ControlACK, pkt.SeqNum),
 	}
+	s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
 }
 
 func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, icmpID, icmpSeq uint16, session *icmp.Session, pkt *icmp.TunnelPacket) {
+	// Handle control messages
 	subtype, streamID, err := icmp.DecodeControlMessage(pkt.Data)
 	if err != nil {
-		s.log.Error("Decode control message: %v", err)
+		s.log.Error("Decode control: %v", err)
 		return
 	}
+	
+	s.log.Debug("Received Control packet: subtype=%d, streamID=%d from %s", subtype, streamID, clientIP)
 
 	switch subtype {
 	case icmp.ControlConnect:
 		req, err := icmp.DecodeConnectRequest(pkt.Data)
 		if err != nil {
 			s.log.Error("Decode connect request: %v", err)
-			return
+			break
 		}
 
 		s.log.Info("Connect request: stream=%d proto=%s dest=%s from %s",
 			req.StreamID, req.Protocol, req.Destination, clientIP)
+
+		connKey := fmt.Sprintf("%s:%d", clientIP, req.StreamID)
+		
+		s.connMu.RLock()
+		_, exists := s.connections[connKey]
+		s.connMu.RUnlock()
+		
+		if exists {
+			s.log.Debug("Connection for stream %s already exists, re-acknowledging", connKey)
+			// Send connect ACK anyway
+			ackPkt := &icmp.TunnelPacket{
+				Type:      icmp.TypeControl,
+				SessionID: session.ID,
+				SeqNum:    session.GetNextSeq(),
+				Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, req.StreamID),
+			}
+			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
+			break
+		}
 
 		// Establish connection to destination
 		var conn net.Conn
@@ -462,7 +502,24 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 			conn, err = net.DialTimeout("udp", req.Destination, 10*time.Second)
 		default:
 			s.log.Error("Unsupported protocol: %s", req.Protocol)
-			return
+			break
+		}
+
+		if err != nil {
+			// (IPv6 retry logic removed for brevity in this chunk, but I'll keep it)
+			dest := req.Destination
+			if strings.Contains(dest, ":") && !strings.HasPrefix(dest, "[") {
+				lastColon := strings.LastIndex(dest, ":")
+				if lastColon != -1 {
+					host := dest[:lastColon]
+					port := dest[lastColon+1:]
+					ipv6Dest := net.JoinHostPort(host, port)
+					if ipv6Dest != dest {
+						s.log.Debug("Retrying connection with IPv6 formatting: %s", ipv6Dest)
+						conn, err = net.DialTimeout(req.Protocol, ipv6Dest, 10*time.Second)
+					}
+				}
+			}
 		}
 
 		if err != nil {
@@ -470,20 +527,20 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 			failPkt := &icmp.TunnelPacket{
 				Type:      icmp.TypeControl,
 				SessionID: session.ID,
+				SeqNum:    session.GetNextSeq(),
 				Data:      icmp.EncodeControlMessage(icmp.ControlConnectFail, req.StreamID),
 			}
-			if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, failPkt); err != nil {
-				s.log.Error("Failed to send connect fail: %v", err)
-			}
-			return
+			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, failPkt)
+			break
 		}
 
-		connKey := fmt.Sprintf("%s:%d", clientIP, req.StreamID)
 		s.connMu.Lock()
 		s.connections[connKey] = conn
 		s.connMu.Unlock()
 
-		// Send connect ACK with streamID
+		stream := session.AddStreamWithID(req.StreamID, req.Protocol, req.Destination)
+
+		// Send connect ACK
 		ackPkt := &icmp.TunnelPacket{
 			Type:      icmp.TypeControl,
 			SessionID: session.ID,
@@ -491,69 +548,115 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 			Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, req.StreamID),
 		}
 		session.RecordSent(ackPkt)
-		if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt); err != nil {
-			s.log.Error("Failed to send connect ACK: %v", err)
-		}
+		s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
 		s.log.Info("Stream %d established to %s", req.StreamID, req.Destination)
 
-
-	// Start reading from destination and sending back
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		defer func() {
-			s.connMu.Lock()
-			delete(s.connections, connKey)
-			s.connMu.Unlock()
-			conn.Close()
+		// Uplink Loop: Session -> Destination
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer func() {
+				conn.Close()
+				s.connMu.Lock()
+				delete(s.connections, connKey)
+				s.connMu.Unlock()
+				session.RemoveStream(req.StreamID)
+				s.log.Debug("Uplink loop for stream %d to %s finished", req.StreamID, req.Destination)
+			}()
+			for {
+				select {
+				case data, ok := <-stream.DataChan:
+					if !ok { 
+						s.log.Debug("Uplink: Stream %d DataChan closed", req.StreamID)
+						return 
+					}
+					s.log.Debug("Uplink: Writing %d bytes to %s for stream %d", len(data), req.Destination, req.StreamID)
+					if _, err := conn.Write(data); err != nil {
+						s.log.Error("Uplink: Write error to %s for stream %d: %v", req.Destination, req.StreamID, err)
+						return
+					}
+				case <-s.done:
+					s.log.Debug("Uplink: Server done signal received for stream %d", req.StreamID)
+					return
+				case <-stream.Done:
+					s.log.Debug("Uplink: Stream %d done signal received", req.StreamID)
+					return
+				}
+			}
 		}()
 
-		maxData := s.calculateMaxStreamData()
-		buf := make([]byte, maxData)
-		for {
-			select {
-			case <-s.done:
-				return
-			default:
-			}
+		// Downlink Loop: Destination -> Session
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer func() {
+				// Note: Do NOT call session.RemoveStream here - the uplink goroutine
+				// handles stream removal. Calling it from both goroutines would
+				// double-close stream.Done and panic.
+				s.connMu.Lock()
+				delete(s.connections, connKey)
+				s.connMu.Unlock()
+				conn.Close()
+				s.log.Debug("Downlink loop for stream %d from %s finished", req.StreamID, req.Destination)
+			}()
 
-			n, err := conn.Read(buf)
-			if err != nil {
-				if err != io.EOF {
-					s.log.Error("Read from %s: %v", req.Destination, err)
+			maxData := s.calculateMaxStreamData()
+			buf := make([]byte, maxData)
+			for {
+				select {
+				case <-s.done:
+					s.log.Debug("Downlink: Server done signal received for stream %d", req.StreamID)
+					return
+				case <-stream.Done:
+					s.log.Debug("Downlink: Stream %d done signal received", req.StreamID)
+					return
+				default:
 				}
-				// Inform client about close
-				closePkt := &icmp.TunnelPacket{
-					Type:      icmp.TypeControl,
+
+				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				n, err := conn.Read(buf)
+				if err != nil {
+					s.log.Debug("Read from %s: %v", req.Destination, err)
+					if err == io.EOF {
+						// Clean close
+						s.log.Debug("Downlink: EOF from %s for stream %d", req.Destination, req.StreamID)
+						// Inform client about close
+						closePkt := &icmp.TunnelPacket{
+							Type:      icmp.TypeControl,
+							SessionID: session.ID,
+							SeqNum:    session.GetNextSeq(),
+							Data:      icmp.EncodeControlMessage(icmp.ControlClose, req.StreamID),
+						}
+						s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, closePkt)
+						return
+					}
+					// Check for "use of closed network connection" which happens on timeout or close
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						continue
+					}
+					s.log.Error("Downlink: Read error from %s for stream %d: %v", req.Destination, req.StreamID, err)
+					// Inform client about close
+					closePkt := &icmp.TunnelPacket{
+						Type:      icmp.TypeControl,
+						SessionID: session.ID,
+						SeqNum:    session.GetNextSeq(),
+						Data:      icmp.EncodeControlMessage(icmp.ControlClose, req.StreamID),
+					}
+					s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, closePkt)
+					return
+				}
+				s.log.Debug("Downlink: Read %d bytes from %s for stream %d", n, req.Destination, req.StreamID)
+
+				dataPkt := &icmp.TunnelPacket{
+					Type:      icmp.TypeData,
 					SessionID: session.ID,
-					Data:      icmp.EncodeControlMessage(icmp.ControlClose, req.StreamID),
+					SeqNum:    session.GetNextSeq(),
+					Data:      icmp.EncodeStreamData(req.StreamID, buf[:n]),
 				}
-				if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, 0, 0, closePkt); err != nil {
-					s.log.Error("Failed to send close notification: %v", err)
-				}
-				return
+				session.RecordSent(dataPkt)
+				s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, dataPkt)
 			}
-
-			streamData := icmp.EncodeStreamData(req.StreamID, buf[:n])
-			
-			// We skip the direct sendResponse and use the session's aggregation/reliable logic
-			// But for now, let's keep it simple and just record it in session for retransmission
-			dataPkt := &icmp.TunnelPacket{
-				Type:      icmp.TypeData,
-				SessionID: session.ID,
-				SeqNum:    session.GetNextSeq(),
-				Data:      streamData,
-			}
-
-			session.RecordSent(dataPkt)
-			if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, 0, 0, dataPkt); err != nil {
-				s.log.Error("Send response to %s failed: %v", clientIP, err)
-				return
-			}
-		}
-	}()
-	case icmp.ControlSACK:
-		// Handled in handlePacket
+		}()
 	case icmp.ControlClose:
 		connKey := fmt.Sprintf("%s:%d", clientIP, streamID)
 		s.connMu.Lock()
@@ -563,24 +666,44 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 			s.log.Info("Closed connection for stream %s", connKey)
 		}
 		s.connMu.Unlock()
+		if session != nil {
+			session.RemoveStream(streamID)
+		}
 
 	case icmp.ControlHeartbeat:
 		// Just acknowledge activity
 
 	case icmp.ControlACK:
-		// This is an ACK for a packet we sent. No action needed on server side.
-		// The client-side logic for pending ACKs would go here if this were client.go
+		// The client is ACKing a packet we sent. Process it to clear inflight.
+		if session != nil {
+			session.ProcessACK(streamID, nil)
+		}
+
+	case icmp.ControlSACK:
+		if session != nil {
+			sack, err := icmp.DecodeSACK(pkt.Data)
+			if err == nil {
+				session.ProcessACK(sack.AckedSeq, sack.Blocks)
+			}
+		}
 	}
 
-	// Always send ACK for control messages except ACKs themselves
-	if subtype != icmp.ControlACK && session != nil {
-		ackPkt := &icmp.TunnelPacket{
-			Type:      icmp.TypeControl,
-			SessionID: session.ID,
-			SeqNum:    session.GetNextSeq(),
-			Data:      icmp.EncodeControlMessage(icmp.ControlACK, pkt.SeqNum),
+	// Send ACK for control messages that don't already send their own response.
+	// ControlACK, ControlSACK, ControlConnect (sends ConnectACK/ConnectFail),
+	// and ControlHeartbeat should not get an extra ACK.
+	switch subtype {
+	case icmp.ControlACK, icmp.ControlSACK, icmp.ControlHeartbeat:
+		// These already have their own response or don't need ACK
+	default:
+		if session != nil {
+			ackPkt := &icmp.TunnelPacket{
+				Type:      icmp.TypeControl,
+				SessionID: session.ID,
+				SeqNum:    session.GetNextSeq(),
+				Data:      icmp.EncodeControlMessage(icmp.ControlACK, pkt.SeqNum),
+			}
+			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, ackPkt)
 		}
-		s.sendResponse(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, ackPkt)
 	}
 }
 
@@ -610,7 +733,7 @@ func (s *Server) calculateMaxStreamData() int {
 
 	// Subtract Tunnel header (9) and Stream Data header (2)
 	room -= icmp.TunnelHeaderSize
-	room -= 2 // StreamDataHeaderSize
+	room -= icmp.StreamDataHeaderSize // Use the constant which is 4
 
 	if room < 64 {
 		room = 64 // Minimum safety
