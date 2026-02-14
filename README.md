@@ -63,13 +63,16 @@ go build -o icmptunnel .
 
 ### 3. Configure
 
-Copy and edit the example configs:
+The `examples/` directory contains several pre-configured scenarios. Choose the one that best matches your network conditions and performance requirements:
 
 ```bash
-cp examples/server.toml my-server.toml
-cp examples/client.toml my-client.toml
-# Edit both files with your token, key, and server IP
+# Example: Using the Basic Tunnel setup
+mkdir -p config
+cp examples/01-basic-tunnel/*.toml config/
+# Edit config/client.toml and config/server.toml with your tokens and IP
 ```
+
+**Note:** Each scenario folder contains a complete, ready-to-use `client.toml` and `server.toml` pair. Just copy the folder's contents and update the `auth_tokens`, `key`, and `server_addr` fields.
 
 ### 4. Run
 
@@ -174,30 +177,49 @@ level = "info"              # debug | info | warn | error
 output = "stdout"           # stdout | stderr | /path/to/file
 ```
 
-### Client Configuration (`client.toml`)
+## Deployment Scenarios
 
-```toml
-server_addr = "1.2.3.4"               # Server IP address
-auth_token = "<your-token>"           # Authentication token
+**icmptunnel** includes several ready-to-use configuration patterns in the `examples/` directory. Each scenario is optimized for a specific real-world condition:
 
-[icmp]
-# Same options as server
+### 📁 `01-basic-tunnel`
+*   **Best for:** General purpose use.
+*   **Details:** Standard ICMP tunnel with SOCKS5 forwarding, minimal evasion, and encryption disabled by default for ease of initial testing.
 
-[encryption]
-# Same options as server (key must match)
+### 📁 `02-high-performance`
+*   **Best for:** Maximum throughput on high-speed reliable links.
+*   **Optimizations:** Wide sliding window (`500`), parallel logical streams, and high pacing responsiveness. Encryption is disabled to minimize CPU latency.
 
-# Multiple SOCKS5 proxy listeners
-[[socks5]]
-listen = "127.0.0.1:1080"             # No authentication
+### 📁 `03-low-latency`
+*   **Best for:** Interactive use, SSH, gaming, or voice calls.
+*   **Optimizations:** Small sliding window to prevent bufferbloat, very fast retransmission timeouts (`50ms`), and no compression to eliminate buffering delays.
 
-[[socks5]]
-listen = "127.0.0.1:1081"
-username = "user"                      # RFC 1929 auth
-password = "pass"
+### 📁 `04-high-packet-loss`
+*   **Best for:** Unreliable satellite links or congested mobile networks.
+*   **Optimizations:** Smaller MTU to avoid fragmentation-related drops, aggressive retransmissions, and compression enabled to maximize usable data per successful packet.
 
-# Port forwarding rules
-[[forwards]]
-listen = "127.0.0.1:8080"             # Local listen address
+### 📁 `05-encrypted-only`
+*   **Best for:** Secure communication with high CPU predictability.
+*   **Details:** AES-256-GCM encryption enabled, compression disabled to prevent CRIME/BREACH-style side-channel attacks on entropy.
+
+### 📁 `06-compressed-encrypted`
+*   **Best for:** Bandwidth-limited secure environments.
+*   **Details:** Combines AES encryption with DEFLATE compression for both security and efficiency.
+
+### 📁 `07-multi-stream`
+*   **Best for:** Heavy parallel workloads (e.g., browsing sites with many assets).
+*   **Optimizations:** High logical stream count and large windows to handle massive parallel SOCKS5 requests without head-of-line blocking.
+
+### 📁 `08-dpi-evasion`
+*   **Best for:** Bypassing Great Firewalls and high-end traffic analyzers.
+*   **Optimizations:** Enables fragmentation, random padding, jitter, and signature mimicry to obfuscate traffic patterns.
+
+### 📁 `09-spoofing-relay`
+*   **Best for:** Restricted environments where direct unsolicited ICMP is dropped.
+*   **Strategy:** Uses a relay server to proxy packets, bypassing stateful firewall restrictions on many modern networks.
+
+### 📁 `10-firewall-restricted`
+*   **Best for:** Heavily rate-limited or strictly filtered corporate proxies.
+*   **Optimizations:** Conservative packet sizes, very slow pacing, and high compression to stay under the radar of automated rate-limiting systems.
 destination = "internal.host:80"       # Remote destination
 protocol = "tcp"                       # tcp | udp
 
