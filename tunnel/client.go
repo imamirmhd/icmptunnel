@@ -351,7 +351,7 @@ func (c *Client) handleConnect(protocol, destination string) (uint16, chan []byt
 		}
 		c.log.Info("Stream %d established to %s", streamID, destination)
 		return streamID, responseChan, nil
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		c.handleClose(streamID)
 		return 0, nil, fmt.Errorf("connect timeout waiting for status")
 	}
