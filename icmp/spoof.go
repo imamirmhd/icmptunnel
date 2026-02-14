@@ -1,7 +1,6 @@
 package icmp
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 )
