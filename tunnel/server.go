@@ -400,6 +400,18 @@ func (s *Server) handleAuth(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 		if session != nil && session.Authenticated && session.AuthToken == token {
 			s.log.Debug("Re-authenticating existing session %08x", pkt.SessionID)
 		} else {
+			// Proactively cleanup old connections for this IP
+			s.connMu.Lock()
+			prefix := clientIP.String() + ":"
+			for key, conn := range s.connections {
+				if strings.HasPrefix(key, prefix) {
+					s.log.Info("Cleaning up stale connection %s due to client restart", key)
+					conn.Close()
+					delete(s.connections, key)
+				}
+			}
+			s.connMu.Unlock()
+
 			session = s.sessionMgr.CreateSessionWithID(clientIP, pkt.SessionID)
 			session.Authenticated = true
 			session.AuthToken = token
@@ -450,8 +462,12 @@ func (s *Server) handleData(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 			continue
 		}
 
-		// Buffer full - block to implement backpressure
-		stream.DataChan <- entry.Data
+		// Non-blocking push to avoid hanging the entire session if one stream is stuck
+		select {
+		case stream.DataChan <- entry.Data:
+		default:
+			s.log.Warn("Downlink buffer full for stream %d, dropping packet", entry.StreamID)
+		}
 	}
 
 	// Immediate ACK to stop client retransmissions
@@ -494,7 +510,7 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 		
 		if exists {
 			s.log.Debug("Connection for stream %s already exists, re-acknowledging", connKey)
-			// Send connect ACK anyway
+			// Send connect ACK
 			ackPkt := &icmp.TunnelPacket{
 				Type:      icmp.TypeControl,
 				SessionID: session.ID,
@@ -502,7 +518,7 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 				Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, uint32(req.StreamID)),
 			}
 			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
-			break
+			return
 		}
 
 		// Establish connection to destination
@@ -622,10 +638,13 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 				case <-stream.Done:
 					s.log.Debug("Downlink: Stream %d done signal received", req.StreamID)
 					return
+				case <-session.Ctx.Done():
+					s.log.Debug("Session %08x closed, stopping downlink loop for stream %d", session.ID, req.StreamID)
+					return
 				default:
 				}
 
-				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				conn.SetReadDeadline(time.Now().Add(time.Second))
 				n, err := conn.Read(buf)
 				if err != nil {
 					s.log.Debug("Read from %s: %v", req.Destination, err)
@@ -743,7 +762,7 @@ func (s *Server) calculateMaxStreamData() int {
 	// Subtract Encryption overhead
 	room -= s.encryptor.Overhead()
 
-	// Subtract Tunnel header (9) and Stream Data header (2)
+	// Subtract Tunnel header (11) and Stream Data header (4)
 	room -= icmp.TunnelHeaderSize
 	room -= icmp.StreamDataHeaderSize // Use the constant which is 4
 

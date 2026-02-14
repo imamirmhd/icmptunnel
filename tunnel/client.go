@@ -786,7 +786,11 @@ func (c *Client) receiveLoop() {
 				c.streamsMu.RLock()
 				for _, entry := range entries {
 					if ch, ok := c.streams[entry.StreamID]; ok {
-						ch <- entry.Data
+						select {
+						case ch <- entry.Data:
+						default:
+							c.log.Warn("Stream %d buffer full, dropping data packet", entry.StreamID)
+						}
 					}
 				}
 				c.streamsMu.RUnlock()
@@ -971,7 +975,7 @@ func (c *Client) calculateMaxStreamData() int {
 	// Subtract Encryption overhead
 	room -= c.encryptor.Overhead()
 
-	// Subtract Tunnel header (9) and Stream Data header (4)
+	// Subtract Tunnel header (11) and Stream Data header (4)
 	room -= icmp.TunnelHeaderSize
 	room -= icmp.StreamDataHeaderSize
 

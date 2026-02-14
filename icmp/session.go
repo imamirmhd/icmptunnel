@@ -12,6 +12,7 @@ import (
 	"compress/flate"
 	"io"
 	"sort"
+	"context"
 
 	"github.com/user/icmptunnel/logger"
 )
@@ -47,6 +48,10 @@ type Session struct {
 
 	// SACK state
 	receivedSeqs  map[uint32]bool
+
+	// Cleanup
+	Ctx    context.Context
+	Cancel context.CancelFunc
 }
 
 type inflightPacket struct {
@@ -115,6 +120,19 @@ func (sm *SessionManager) CreateSessionWithID(clientAddr net.IP, id uint32) *Ses
 		OutboundICMPSeq: 0,
 	}
 
+	// Check for existing session with same IP
+	if old, ok := sm.sessionsByAddr[clientAddr.String()]; ok {
+		if old.ID != id {
+			sm.log.Info("Replacing old session %08x with %08x for client %s", old.ID, id, clientAddr)
+			old.Close()
+			delete(sm.sessions, old.ID)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	session.Ctx = ctx
+	session.Cancel = cancel
+
 	sm.sessions[id] = session
 	sm.sessionsByAddr[clientAddr.String()] = session
 	sm.log.Info("Created session %08x for client %s", id, clientAddr)
@@ -147,6 +165,7 @@ func (sm *SessionManager) RemoveSession(id uint32) {
 	defer sm.mu.Unlock()
 
 	if session, ok := sm.sessions[id]; ok {
+		session.Close()
 		delete(sm.sessionsByAddr, session.ClientAddr.String())
 		delete(sm.sessions, id)
 		sm.log.Info("Removed session %08x", id)
@@ -495,14 +514,35 @@ func (sm *SessionManager) cleanupLoop() {
 		for id, session := range sm.sessions {
 			session.Mu.Lock()
 			if now.Sub(session.LastActivity) > sm.timeout {
+				session.Mu.Unlock()
 				sm.log.Info("Session %08x timed out (idle %v)", id, now.Sub(session.LastActivity))
+				session.Close()
 				delete(sm.sessionsByAddr, session.ClientAddr.String())
 				delete(sm.sessions, id)
+			} else {
+				session.Mu.Unlock()
 			}
-			session.Mu.Unlock()
 		}
 		sm.mu.Unlock()
 	}
+}
+
+// Close terminates the session and all its streams.
+func (s *Session) Close() {
+	s.Mu.Lock()
+	if s.Cancel != nil {
+		s.Cancel()
+	}
+	// Close all streams
+	for id, stream := range s.Streams {
+		select {
+		case <-stream.Done:
+		default:
+			close(stream.Done)
+		}
+		delete(s.Streams, id)
+	}
+	s.Mu.Unlock()
 }
 
 // ActiveSessions returns the number of active sessions.
