@@ -102,13 +102,20 @@ curl --socks5 127.0.0.1:1080 https://example.com
 | `icmptunnel server --config <path>` | Start the tunnel server |
 | `icmptunnel client --config <path>` | Start the tunnel client |
 | `icmptunnel relay --config <path>` | Start the ICMP relay for spoofing |
+| `icmptunnel debug ping <target>` | ICMP connectivity test |
+| `icmptunnel debug throughput <target>` | Measure ICMP throughput |
+| `icmptunnel debug loss <target>` | Measure packet loss |
+| `icmptunnel debug detect <target>` | Detect DPI/firewall interference |
+| `icmptunnel debug spoof-test <relay> <server>` | Test spoofing via relay |
+| `icmptunnel debug status <target>` | Check if tunnel server is alive |
 | `icmptunnel keygen [--token] [--method <m>]` | Generate keys/tokens |
 | `icmptunnel install` | Install system-wide |
 | `icmptunnel service create <name>` | Create a systemd service |
 | `icmptunnel service start|stop|restart <name>` | Manage services |
+| `icmptunnel service status <name>` | Show service status |
 | `icmptunnel service logs <name> [-f]` | View service logs |
 | `icmptunnel service list` | List all managed services |
-| `icmptunnel debug status <target>` | Check if tunnel server is alive |
+| `icmptunnel service remove <name>` | Remove a service |
 
 ## Configuration Reference
 
@@ -123,6 +130,8 @@ max_packet_size = 1472    # Max ICMP payload (MTU minus IP header)
 ttl = 64                  # IP Time-To-Live
 read_timeout = "5s"       # Socket read timeout
 write_timeout = "5s"      # Socket write timeout
+sequence_start = 0        # Starting ICMP sequence number
+id_range = [1, 65535]     # ICMP ID range for packets
 
 [encryption]
 enabled = true
@@ -133,10 +142,39 @@ key = "<hex-encoded-key>"
 disable_echo_reply = true   # Suppress kernel ICMP echo replies
 enable_forwarding = true    # Enable IP forwarding
 
-[transport]
-window_size = 100
-compression = true
-retransmission_timeout = "200ms"
+[evasion.fragmentation]
+enabled = false
+max_fragment_size = 512     # Max bytes per fragment
+
+[evasion.padding]
+enabled = false
+min_size = 8                # Minimum random padding bytes
+max_size = 64               # Maximum random padding bytes
+
+[evasion.jitter]
+enabled = false
+min_delay = "10ms"          # Minimum inter-packet delay
+max_delay = "100ms"         # Maximum inter-packet delay
+
+[evasion.mimicry]
+enabled = false
+os_signature = "linux"      # linux | windows | macos
+
+[evasion.checksum]
+enabled = false             # Alternate checksum strategies
+
+[evasion.adaptive_size]
+enabled = false
+min_size = 64               # Minimum packet size
+max_size = 1400             # Maximum packet size
+step_size = 64              # Size increment per packet
+
+[relay]
+enabled = false             # Accept spoofed ICMP packets
+
+[logging]
+level = "info"              # debug | info | warn | error
+output = "stdout"           # stdout | stderr | /path/to/file
 ```
 
 ### Client Configuration (`client.toml`)
@@ -151,14 +189,124 @@ auth_token = "<your-token>"           # Authentication token
 [encryption]
 # Same options as server (key must match)
 
+# Multiple SOCKS5 proxy listeners
 [[socks5]]
 listen = "127.0.0.1:1080"             # No authentication
 
+[[socks5]]
+listen = "127.0.0.1:1081"
+username = "user"                      # RFC 1929 auth
+password = "pass"
+
+# Port forwarding rules
 [[forwards]]
 listen = "127.0.0.1:8080"             # Local listen address
 destination = "internal.host:80"       # Remote destination
 protocol = "tcp"                       # tcp | udp
+
+[[forwards]]
+listen = "127.0.0.1:5353"
+destination = "8.8.8.8:53"
+protocol = "udp"
+
+[evasion.*]
+# Same options as server
+
+[spoof]
+enabled = false                        # Enable ICMP spoofing
+relay_addr = "198.51.100.1"           # Relay server IP
+route_via_relay = false                # Response routing preference
+
+[logging]
+# Same options as server
 ```
+
+### Relay Configuration (`relay.toml`)
+
+```toml
+listen = "0.0.0.0"
+allowed_sources = []                   # IP/CIDR whitelist (empty = all)
+rate_limit = 1000                      # Max packets/sec per source
+
+[logging]
+level = "info"
+output = "stdout"
+```
+
+## Unified Token-Based Ping
+
+The **icmptunnel** server implements a user-space ICMP responder that integrates with the authentication system. This provides a "Secure Ping" mechanism:
+
+- **Auth-Protected Connectivity**: standard ICMP echo requests sent to the server are only answered if the payload contains a valid `auth_token`.
+- **Connectivity & Credential Verification**: A successful ping response simultaneously proves that the ICMP path is open and your authentication token is valid.
+- **Kernel-Independent Reliability**: When `firewall.disable_echo_reply = true` is set, the server ignores automatic OS replies and instead generates replies directly within the `icmptunnel` service after token validation.
+- **Stealth**: Pings with missing or invalid tokens are silently dropped, making the server appear non-existent to unauthorized probes.
+
+To test this manually:
+```bash
+# Using standard ping (if payload supports custom data)
+ping <server-ip> -p $(echo -n "your-token" | xxd -p)
+```
+
+## Encryption
+
+| Method | Key Size | Security | Performance |
+|--------|----------|----------|-------------|
+| `aes-256-gcm` | 32 bytes | ★★★★★ High | ★★★★ Fast (AES-NI) |
+| `chacha20-poly1305` | 32 bytes | ★★★★★ High | ★★★★★ Fastest (non-AES-NI) |
+| `xor` | Any | ★☆☆☆☆ Obfuscation only | ★★★★★ Minimal overhead |
+
+Generate keys with `icmptunnel keygen --method <method>`. Both client and server must use the **same key and method**.
+
+> ⚠️ XOR is NOT cryptographically secure. Use only when encryption overhead is unacceptable and basic obfuscation suffices.
+
+## DPI Evasion Techniques
+
+### Packet Fragmentation
+Splits tunnel payloads into smaller fragments to bypass size-based detection. Each fragment carries a header with fragment ID, index, and total count for reassembly.
+
+### Payload Randomization
+Appends random padding bytes (configurable range) to every packet, preventing fixed-size pattern matching. A trailing length byte enables reliable removal.
+
+### Timing Jitter
+Introduces random delays between packet transmissions to prevent traffic analysis based on timing regularity. Configurable min/max delay range.
+
+### Protocol Mimicry
+Adjusts ICMP headers (TTL, type/code, ID patterns, sequence numbers, payload fill bytes) to match legitimate ping signatures from specific operating systems (Linux, Windows, macOS).
+
+### Checksum Manipulation
+Uses alternating checksum computation strategies that produce valid checksums via different code paths, preventing fingerprinting by DPI systems that look for specific checksum implementations.
+
+### Adaptive Packet Sizing
+Cycles packet sizes through a configurable range (min→max with step increments), defeating detection rules that match fixed-size ICMP payloads.
+
+## ICMP Spoofing with Relay
+
+For environments where direct ICMP to the server is blocked:
+
+1. **Client** sends ICMP echo request to the **relay server** with the source IP forged to the **main server's IP**
+2. The **relay** echoes back to the forged source (the main server)
+3. The **main server** receives the packet, extracts the **real client IP** from the payload
+4. Server responds either **directly to the client** or **back through the relay**, based on a routing flag embedded in the payload
+
+### Setup
+
+```bash
+# On the relay (intermediary server)
+sudo ./icmptunnel relay --config relay.toml
+
+# Server config: enable relay support
+# [relay]
+# enabled = true
+
+# Client config: enable spoofing
+# [spoof]
+# enabled = true
+# relay_addr = "relay-ip"
+# route_via_relay = false
+```
+
+> ⚠️ IP spoofing requires: root privileges, `rp_filter=0` on the client, and a relay that does not drop forged-source packets.
 
 ## Transport Layer & Reliability
 
@@ -170,29 +318,58 @@ protocol = "tcp"                       # tcp | udp
 - **Compression**: Real-time DEFLATE/LZ4 style compression to reduce bandwidth usage.
 - **Connection Resilience**: Automatic heartbeat mechanisms and exponential backoff reconnection strategies ensure the tunnel recovers from temporary outages.
 
+Configure these settings in the `[transport]` section of your config:
+
+```toml
+[transport]
+window_size = 100
+compression = true
+retransmission_timeout = "200ms"
+```
+
 ## Deployment Scenarios
 
-**icmptunnel** includes several ready-to-use configuration patterns in the `examples/` directory:
+**icmptunnel** includes several ready-to-use configuration patterns in the `examples/` directory. Each scenario is optimized for a specific real-world condition:
 
 ### 📁 `01-basic-tunnel`
 *   **Best for:** General purpose use.
-*   **Details:** Standard ICMP tunnel with SOCKS5 forwarding and minimal evasion.
+*   **Details:** Standard ICMP tunnel with SOCKS5 forwarding, minimal evasion, and encryption disabled by default for ease of initial testing.
 
 ### 📁 `02-high-performance`
 *   **Best for:** Maximum throughput on high-speed reliable links.
-*   **Optimizations:** Wide sliding window (`500`) and parallel logical streams.
+*   **Optimizations:** Wide sliding window (`500`), parallel logical streams, and high pacing responsiveness. Encryption is disabled to minimize CPU latency.
 
 ### 📁 `03-low-latency`
 *   **Best for:** Interactive use, SSH, gaming, or voice calls.
-*   **Optimizations:** Small sliding window to prevent bufferbloat and fast retransmission timeouts.
+*   **Optimizations:** Small sliding window to prevent bufferbloat, very fast retransmission timeouts (`50ms`), and no compression to eliminate buffering delays.
 
 ### 📁 `04-high-packet-loss`
 *   **Best for:** Unreliable satellite links or congested mobile networks.
-*   **Optimizations:** Smaller MTU and aggressive retransmissions.
+*   **Optimizations:** Smaller MTU to avoid fragmentation-related drops, aggressive retransmissions, and compression enabled to maximize usable data per successful packet.
+
+### 📁 `05-encrypted-only`
+*   **Best for:** Secure communication with high CPU predictability.
+*   **Details:** AES-256-GCM encryption enabled, compression disabled to prevent CRIME/BREACH-style side-channel attacks on entropy.
+
+### 📁 `06-compressed-encrypted`
+*   **Best for:** Bandwidth-limited secure environments.
+*   **Details:** Combines AES encryption with DEFLATE compression for both security and efficiency.
+
+### 📁 `07-multi-stream`
+*   **Best for:** Heavy parallel workloads (e.g., browsing sites with many assets).
+*   **Optimizations:** High logical stream count and large windows to handle massive parallel SOCKS5 requests without head-of-line blocking.
 
 ### 📁 `08-dpi-evasion`
 *   **Best for:** Bypassing Great Firewalls and high-end traffic analyzers.
-*   **Optimizations:** Enables fragmentation, random padding, jitter, and signature mimicry.
+*   **Optimizations:** Enables fragmentation, random padding, jitter, and signature mimicry to obfuscate traffic patterns.
+
+### 📁 `09-spoofing-relay`
+*   **Best for:** Restricted environments where direct unsolicited ICMP is dropped.
+*   **Strategy:** Uses a relay server to proxy packets, bypassing stateful firewall restrictions on many modern networks.
+
+### 📁 `10-firewall-restricted`
+*   **Best for:** Heavily rate-limited or strictly filtered corporate proxies.
+*   **Optimizations:** Conservative packet sizes, very slow pacing, and high compression to stay under the radar of automated rate-limiting systems.
 
 ## Troubleshooting
 
@@ -200,18 +377,34 @@ protocol = "tcp"                       # tcp | udp
 |-------|----------|
 | `creating raw socket: operation not permitted` | Run with `sudo` or grant `CAP_NET_RAW` |
 | Authentication timeout | Verify tokens match between client and server configs |
-| No reply from server | Check `firewall.disable_echo_reply = true` on server |
+| No reply from server | Check `firewall.disable_echo_reply = true` on server; verify ICMP is not blocked |
 | Large packets dropped | Enable `evasion.fragmentation` with smaller `max_fragment_size` |
+| Inconsistent connectivity | Enable `evasion.jitter` to avoid rate limiting |
 | DPI blocking traffic | Run `debug detect` to identify issues, enable mimicry + encryption |
+| Spoofed packets not arriving | Check `rp_filter` settings; run `debug spoof-test` |
+| Service won't start | Check `icmptunnel service logs <name>` for errors |
 | Config validation error | Use `--dry-run` flag to validate without starting |
 
 ## Project Structure
 
-- `cmd/`: Command-line interface definitions
-- `config/`: Configuration loading and validation
-- `icmp/`: Core ICMP socket and session logic
-- `tunnel/`: Client and server tunnel implementations
-- `crypto/`: Encryption providers (AES, ChaCha20, XOR)
-- `proxy/`: SOCKS5 and port forwarding logic
-- `evasion/`: DPI evasion and packet shaping
-- `examples/`: Scenario-based configuration templates
+```
+icmptunnel/
+├── main.go              # Entry point
+├── cmd/                 # CLI commands (cobra)
+├── config/              # TOML configuration
+├── icmp/                # Raw ICMP socket, packet framing, sessions
+├── crypto/              # Encryption (AES, ChaCha20, XOR)
+├── auth/                # Token authentication
+├── evasion/             # DPI evasion techniques
+├── proxy/               # SOCKS5 proxy & port forwarding
+├── tunnel/              # Client/server tunnel logic
+├── relay/               # Relay server for spoofing
+├── diag/                # Diagnostics & debugging
+├── service/             # Installation & systemd management
+├── logger/              # Structured logging
+└── examples/            # Example configuration files
+```
+
+## License
+
+MIT License
