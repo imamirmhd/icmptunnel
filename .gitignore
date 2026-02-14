@@ -2,6 +2,7 @@ icmptunnel
 *.log
 *.exe
 bin/
+test/
 test/local_*.toml
 .agent/
 .system_generated/
