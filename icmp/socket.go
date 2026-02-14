@@ -65,7 +65,7 @@ func (s *Socket) Bind() error {
 }
 
 // Send sends an ICMP packet to the destination with the given source address.
-func (s *Socket) Send(srcIP, destIP net.IP, icmpType uint8, payload []byte) error {
+func (s *Socket) Send(srcIP, destIP net.IP, icmpType uint8, id, seq uint16, payload []byte) error {
 	src4 := srcIP.To4()
 	dst4 := destIP.To4()
 	if src4 == nil || dst4 == nil {
@@ -96,8 +96,8 @@ func (s *Socket) Send(srcIP, destIP net.IP, icmpType uint8, payload []byte) erro
 	packet[21] = 0         // Code
 	packet[22] = 0         // Checksum (fill later)
 	packet[23] = 0
-	binary.BigEndian.PutUint16(packet[24:26], uint16(randID())) // ID
-	binary.BigEndian.PutUint16(packet[26:28], uint16(randID())) // Sequence
+	binary.BigEndian.PutUint16(packet[24:26], id)  // ID
+	binary.BigEndian.PutUint16(packet[26:28], seq) // Sequence
 
 	// Payload
 	copy(packet[28:], payload)
@@ -116,19 +116,26 @@ func (s *Socket) Send(srcIP, destIP net.IP, icmpType uint8, payload []byte) erro
 	return syscall.Sendto(s.fd, packet, 0, &dest)
 }
 
-// SendEcho sends an ICMP echo request.
-func (s *Socket) SendEcho(srcIP, destIP net.IP, payload []byte) error {
-	return s.Send(srcIP, destIP, 8, payload) // ICMP Echo Request = 8
+// SendEcho sends an ICMP echo request with specific or random ID/Seq.
+// If id/seq are 0, they will be generated randomly.
+func (s *Socket) SendEcho(srcIP, destIP net.IP, id, seq uint16, payload []byte) error {
+	if id == 0 {
+		id = randID()
+	}
+	if seq == 0 {
+		seq = randID()
+	}
+	return s.Send(srcIP, destIP, 8, id, seq, payload) // ICMP Echo Request = 8
 }
 
-// SendReply sends an ICMP echo reply.
-func (s *Socket) SendReply(srcIP, destIP net.IP, payload []byte) error {
-	return s.Send(srcIP, destIP, 0, payload) // ICMP Echo Reply = 0
+// SendReply sends an ICMP echo reply matching the given ID and Sequence.
+func (s *Socket) SendReply(srcIP, destIP net.IP, id, seq uint16, payload []byte) error {
+	return s.Send(srcIP, destIP, 0, id, seq, payload) // ICMP Echo Reply = 0
 }
 
 // Receive reads one ICMP packet from the socket.
-// Returns the source IP, ICMP type, and payload.
-func (s *Socket) Receive() (srcIP net.IP, icmpType uint8, payload []byte, err error) {
+// Returns the source IP, ICMP type, ID, Sequence, and payload.
+func (s *Socket) Receive() (srcIP net.IP, icmpType uint8, id, seq uint16, payload []byte, err error) {
 	buf := make([]byte, s.maxPacketSize+20+8)
 
 	// Set read deadline
@@ -137,28 +144,32 @@ func (s *Socket) Receive() (srcIP net.IP, icmpType uint8, payload []byte, err er
 
 	n, from, err := syscall.Recvfrom(s.fd, buf, 0)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("receiving: %w", err)
+		return nil, 0, 0, 0, nil, fmt.Errorf("receiving: %w", err)
 	}
 
 	if n < 28 { // Min: 20 IP + 8 ICMP
-		return nil, 0, nil, fmt.Errorf("packet too small: %d bytes", n)
+		return nil, 0, 0, 0, nil, fmt.Errorf("packet too small: %d bytes", n)
 	}
 
 	// Extract source IP from sockaddr
 	if sa, ok := from.(*syscall.SockaddrInet4); ok {
 		srcIP = net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3])
 	} else {
-		return nil, 0, nil, fmt.Errorf("unexpected sockaddr type")
+		return nil, 0, 0, 0, nil, fmt.Errorf("unexpected sockaddr type")
 	}
 
 	// Parse IP header to get IHL
 	ihl := int(buf[0]&0x0f) * 4
 	if n < ihl+8 {
-		return nil, 0, nil, fmt.Errorf("packet too small for headers")
+		return nil, 0, 0, 0, nil, fmt.Errorf("packet too small for headers")
 	}
 
 	// ICMP type
 	icmpType = buf[ihl]
+	
+	// Extract ID and Sequence (bytes 4-8 of ICMP header, which starts at ihl)
+	id = binary.BigEndian.Uint16(buf[ihl+4 : ihl+6])
+	seq = binary.BigEndian.Uint16(buf[ihl+6 : ihl+8])
 
 	// Payload starts after IP header + 8 byte ICMP header
 	payloadStart := ihl + 8
@@ -167,7 +178,7 @@ func (s *Socket) Receive() (srcIP net.IP, icmpType uint8, payload []byte, err er
 		copy(payload, buf[payloadStart:n])
 	}
 
-	return srcIP, icmpType, payload, nil
+	return srcIP, icmpType, id, seq, payload, nil
 }
 
 // Close closes the raw socket.

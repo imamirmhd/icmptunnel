@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/user/icmptunnel/icmp"
@@ -13,8 +14,9 @@ import (
 
 // Diagnostics provides various tunnel testing capabilities.
 type Diagnostics struct {
-	socket *icmp.Socket
-	log    *logger.Logger
+	socket    *icmp.Socket
+	log       *logger.Logger
+	authToken string
 }
 
 // New creates a new diagnostics instance.
@@ -67,11 +69,19 @@ func (d *Diagnostics) Ping(target string, count int) (*PingResult, error) {
 
 	for i := 0; i < count; i++ {
 		// Build ICMP echo request with timestamp
-		payload := make([]byte, 8)
-		binary.BigEndian.PutUint64(payload, uint64(time.Now().UnixNano()))
+		tsPayload := make([]byte, 8)
+		binary.BigEndian.PutUint64(tsPayload, uint64(time.Now().UnixNano()))
+		
+		var payload []byte
+		if d.authToken != "" {
+			// Prefix with auth token
+			payload = append([]byte(d.authToken), tsPayload...)
+		} else {
+			payload = tsPayload
+		}
 
 		start := time.Now()
-		if err := d.socket.SendEcho(localIP, targetIP, payload); err != nil {
+		if err := d.socket.SendEcho(localIP, targetIP, 0, 0, payload); err != nil {
 			fmt.Printf("Request %d: send error: %v\n", i+1, err)
 			result.Lost++
 			continue
@@ -81,18 +91,34 @@ func (d *Diagnostics) Ping(target string, count int) (*PingResult, error) {
 		deadline := time.Now().Add(5 * time.Second)
 		received := false
 		for time.Now().Before(deadline) {
-			srcIP, icmpType, _, err := d.socket.Receive()
+			srcIP, icmpType, _, _, recvPayload, err := d.socket.Receive()
 			if err != nil {
 				continue
 			}
 			if icmpType == 0 && srcIP.Equal(targetIP) {
-				rtt := time.Since(start)
-				result.RTTs = append(result.RTTs, rtt)
-				result.Received++
-				received = true
+				valid := false
+				if d.authToken != "" {
+					if strings.HasPrefix(string(recvPayload), d.authToken) {
+						valid = true
+						// Extract timestamp from suffix?
+						// Actually we just check RTT from sent time.
+						// We don't strictly parse the timestamp from the reply unless needed.
+						// But verifying content is good.
+					}
+				} else {
+					// Legacy: valid if echo came back
+					valid = true
+				}
 
-				fmt.Printf("Reply from %s: time=%v\n", srcIP, rtt.Round(time.Microsecond))
-				break
+				if valid {
+					rtt := time.Since(start)
+					result.RTTs = append(result.RTTs, rtt)
+					result.Received++
+					received = true
+	
+					fmt.Printf("Reply from %s: time=%v\n", srcIP, rtt.Round(time.Microsecond))
+					break
+				}
 			}
 		}
 
@@ -165,7 +191,7 @@ func (d *Diagnostics) Throughput(target string, durationSec int) (*ThroughputRes
 
 	start := time.Now()
 	for time.Since(start) < testDuration {
-		if err := d.socket.SendEcho(localIP, targetIP, payload); err != nil {
+		if err := d.socket.SendEcho(localIP, targetIP, 0, 0, payload); err != nil {
 			continue
 		}
 		result.BytesSent += len(payload)
@@ -207,14 +233,14 @@ func (d *Diagnostics) PacketLoss(target string, count int) (*PacketLossResult, e
 		payload := make([]byte, 64)
 		binary.BigEndian.PutUint32(payload, uint32(i))
 
-		if err := d.socket.SendEcho(localIP, targetIP, payload); err != nil {
+		if err := d.socket.SendEcho(localIP, targetIP, 0, 0, payload); err != nil {
 			continue
 		}
 
 		// Check for reply
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
-			srcIP, icmpType, _, err := d.socket.Receive()
+			srcIP, icmpType, _, _, _, err := d.socket.Receive()
 			if err != nil {
 				continue
 			}
@@ -329,7 +355,7 @@ func (d *Diagnostics) SpoofTest(relayAddr, mainServerAddr string) error {
 	payload := []byte("SPOOF_TEST")
 
 	// Send ICMP echo to relay with spoofed source (server IP)
-	if err := d.socket.SendEcho(serverIP, relayIP, payload); err != nil {
+	if err := d.socket.SendEcho(serverIP, relayIP, 0, 0, payload); err != nil {
 		fmt.Printf("FAIL: Could not send spoofed packet: %v\n", err)
 		return err
 	}
@@ -340,6 +366,11 @@ func (d *Diagnostics) SpoofTest(relayAddr, mainServerAddr string) error {
 	return nil
 }
 
+// SetAuthToken sets the authentication token for diagnostics.
+func (d *Diagnostics) SetAuthToken(token string) {
+	d.authToken = token
+}
+
 // StatusCheck verifies if a tunnel server is alive.
 func (d *Diagnostics) StatusCheck(target string) error {
 	targetIP := net.ParseIP(target)
@@ -348,31 +379,50 @@ func (d *Diagnostics) StatusCheck(target string) error {
 	}
 
 	localIP := getLocalIP()
+	var payload []byte
 
-	// Send a diagnostic tunnel packet
-	diagPkt := &icmp.TunnelPacket{
-		Type:   icmp.TypeDiag,
-		SeqNum: 1,
-		Data:   []byte("STATUS_CHECK"),
+	// If authToken is set, use it as the payload (Unified Token-Based Ping)
+	if d.authToken != "" {
+		payload = []byte(d.authToken)
+		fmt.Printf("Checking tunnel server at %s using auth token...\n", target)
+	} else {
+		// Fallback to legacy diagnostic packet (likely to fail if encryption enforced)
+		diagPkt := &icmp.TunnelPacket{
+			Type:   icmp.TypeDiag,
+			SeqNum: 1,
+			Data:   []byte("STATUS_CHECK"),
+		}
+		payload = diagPkt.Encode()
+		fmt.Printf("Checking tunnel server at %s (legacy mode)...\n", target)
 	}
 
-	fmt.Printf("Checking tunnel server at %s...\n", target)
-
-	if err := d.socket.SendEcho(localIP, targetIP, diagPkt.Encode()); err != nil {
+	if err := d.socket.SendEcho(localIP, targetIP, 0, 0, payload); err != nil {
 		return fmt.Errorf("send failed: %w", err)
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		srcIP, icmpType, payload, err := d.socket.Receive()
+		srcIP, icmpType, _, _, recvPayload, err := d.socket.Receive()
 		if err != nil {
 			continue
 		}
-		if icmpType == 0 && srcIP.Equal(targetIP) && len(payload) > 0 {
-			pkt, err := icmp.DecodeTunnelPacket(payload)
-			if err == nil && pkt.Type == icmp.TypeDiag {
-				fmt.Printf("Server is ALIVE at %s\n", target)
-				return nil
+		
+		if icmpType == 0 && srcIP.Equal(targetIP) {
+			// Check for Token match (Unified Ping)
+			if d.authToken != "" {
+				if string(recvPayload) == d.authToken {
+					fmt.Printf("Server is ALIVE at %s (Token Verified)\n", target)
+					return nil
+				}
+			}
+
+			// Check for Diag Packet (Legacy)
+			if len(recvPayload) > 0 {
+				pkt, err := icmp.DecodeTunnelPacket(recvPayload)
+				if err == nil && pkt.Type == icmp.TypeDiag {
+					fmt.Printf("Server is ALIVE at %s (Diag Response)\n", target)
+					return nil
+				}
 			}
 		}
 	}
@@ -382,12 +432,12 @@ func (d *Diagnostics) StatusCheck(target string) error {
 }
 
 func (d *Diagnostics) testPacket(src, dst net.IP, payload []byte) bool {
-	if err := d.socket.SendEcho(src, dst, payload); err != nil {
+	if err := d.socket.SendEcho(src, dst, 0, 0, payload); err != nil {
 		return false
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		srcIP, icmpType, _, err := d.socket.Receive()
+		srcIP, icmpType, _, _, _, err := d.socket.Receive()
 		if err != nil {
 			continue
 		}

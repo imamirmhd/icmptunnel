@@ -1,13 +1,8 @@
-# Binaries
 icmptunnel
-
-# Logs
 *.log
-nohup.out
-
-# Test environment
-test_env/
-http.pid
-
-# OS files
+*.exe
+bin/
+test/local_*.toml
+.agent/
+.system_generated/
 .DS_Store

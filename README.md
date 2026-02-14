@@ -13,7 +13,8 @@
 | **Encryption** | AES-256-GCM, ChaCha20-Poly1305, or XOR obfuscation |
 | **DPI Evasion** | 6 techniques: fragmentation, padding, jitter, mimicry, checksum manipulation, adaptive sizing |
 | **ICMP Spoofing** | Relay-based spoofing for environments where direct ICMP is blocked |
-| **Authentication** | HMAC-SHA256 token-based authentication against unauthorized access |
+| **Authentication** | Unified token-based validation for both session auth and ICMP connectivity |
+| **User-Space ICMP** | Application-level echo replies for reliability when kernel replies are disabled |
 | **Diagnostics** | Ping, throughput, packet loss, DPI detection, spoof verification |
 | **Service Management** | systemd integration with install, start/stop/restart, logs |
 | **TOML Configuration** | Fully configurable via human-readable TOML files |
@@ -226,6 +227,21 @@ rate_limit = 1000                      # Max packets/sec per source
 [logging]
 level = "info"
 output = "stdout"
+```
+
+## Unified Token-Based Ping
+
+The **icmptunnel** server implements a user-space ICMP responder that integrates with the authentication system. This provides a "Secure Ping" mechanism:
+
+- **Auth-Protected Connectivity**: standard ICMP echo requests sent to the server are only answered if the payload contains a valid `auth_token`.
+- **Connectivity & Credential Verification**: A successful ping response simultaneously proves that the ICMP path is open and your authentication token is valid.
+- **Kernel-Independent Reliability**: When `firewall.disable_echo_reply = true` is set, the server ignores automatic OS replies and instead generates replies directly within the `icmptunnel` service after token validation.
+- **Stealth**: Pings with missing or invalid tokens are silently dropped, making the server appear non-existent to unauthorized probes.
+
+To test this manually:
+```bash
+# Using standard ping (if payload supports custom data)
+ping <server-ip> -p $(echo -n "your-token" | xxd -p)
 ```
 
 ## Encryption

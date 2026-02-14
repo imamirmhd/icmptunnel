@@ -23,6 +23,8 @@ type Session struct {
 	CreatedAt     time.Time
 	LastActivity  time.Time
 	Streams       map[uint16]*Stream // Multiplexed streams within a session
+	recvBuf       map[uint16]*TunnelPacket
+	nextRecvSeq   uint16
 	mu            sync.Mutex
 }
 
@@ -67,9 +69,11 @@ func (sm *SessionManager) CreateSessionWithID(clientAddr net.IP, id uint32) *Ses
 	session := &Session{
 		ID:           id,
 		ClientAddr:   clientAddr,
-		CreatedAt:    now,
-		LastActivity: now,
-		Streams:      make(map[uint16]*Stream),
+		CreatedAt:     now,
+		LastActivity:  now,
+		Streams:       make(map[uint16]*Stream),
+		recvBuf:       make(map[uint16]*TunnelPacket),
+		nextRecvSeq:   0,
 	}
 
 	sm.sessions[id] = session
@@ -129,6 +133,40 @@ func (s *Session) GetNextSeq() uint16 {
 	seq := s.NextSeqSend
 	s.NextSeqSend++
 	return seq
+}
+
+// ProcessIncoming handles sequence numbers and reordering.
+// Returns a slice of packets that are now in-order and ready to be processed.
+func (s *Session) ProcessIncoming(pkt *TunnelPacket) []*TunnelPacket {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// If this is exactly what we expect
+	if pkt.SeqNum == s.nextRecvSeq {
+		s.nextRecvSeq++
+		result := []*TunnelPacket{pkt}
+
+		// Check buffer for subsequent packets
+		for {
+			if nextPkt, ok := s.recvBuf[s.nextRecvSeq]; ok {
+				result = append(result, nextPkt)
+				delete(s.recvBuf, s.nextRecvSeq)
+				s.nextRecvSeq++
+			} else {
+				break
+			}
+		}
+		return result
+	}
+
+	// Out of order: buffer it if it's not too far ahead
+	diff := pkt.SeqNum - s.nextRecvSeq
+	if diff < 1000 { // Max 1000 packets ahead
+		s.recvBuf[pkt.SeqNum] = pkt
+	}
+	
+	// If it's old (already processed), ignore it
+	return nil
 }
 
 // AddStream adds a new data stream to the session.
@@ -212,33 +250,38 @@ type ConnectRequest struct {
 func EncodeConnectRequest(req *ConnectRequest) []byte {
 	protoBytes := []byte(req.Protocol)
 	destBytes := []byte(req.Destination)
-	buf := make([]byte, 2+1+len(protoBytes)+2+len(destBytes)+1)
+	// Format: [1B subtype][2B stream_id][1B proto_len][NB proto][2B dest_len][NB dest]
+	buf := make([]byte, 1+2+1+len(protoBytes)+2+len(destBytes))
 
-	binary.BigEndian.PutUint16(buf[0:2], req.StreamID)
-	buf[2] = byte(len(protoBytes))
-	copy(buf[3:3+len(protoBytes)], protoBytes)
-	off := 3 + len(protoBytes)
+	buf[0] = ControlConnect
+	binary.BigEndian.PutUint16(buf[1:3], req.StreamID)
+	buf[3] = byte(len(protoBytes))
+	copy(buf[4:4+len(protoBytes)], protoBytes)
+	off := 4 + len(protoBytes)
 	binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(destBytes)))
 	copy(buf[off+2:], destBytes)
-	buf[len(buf)-1] = ControlConnect // subtype marker
 
 	return buf
 }
 
-// DecodeConnectRequest deserializes a connect request.
+// DecodeConnectRequest deserializes a connect request (payload after subtype).
 func DecodeConnectRequest(data []byte) (*ConnectRequest, error) {
-	if len(data) < 6 {
+	if len(data) < 7 {
 		return nil, fmt.Errorf("connect request too short")
 	}
 
+	if data[0] != ControlConnect {
+		return nil, fmt.Errorf("not a connect request: %02x", data[0])
+	}
+
 	req := &ConnectRequest{}
-	req.StreamID = binary.BigEndian.Uint16(data[0:2])
-	protoLen := int(data[2])
-	if len(data) < 3+protoLen+2 {
+	req.StreamID = binary.BigEndian.Uint16(data[1:3])
+	protoLen := int(data[3])
+	if len(data) < 4+protoLen+2 {
 		return nil, fmt.Errorf("connect request truncated at protocol")
 	}
-	req.Protocol = string(data[3 : 3+protoLen])
-	off := 3 + protoLen
+	req.Protocol = string(data[4 : 4+protoLen])
+	off := 4 + protoLen
 	destLen := int(binary.BigEndian.Uint16(data[off : off+2]))
 	if len(data) < off+2+destLen {
 		return nil, fmt.Errorf("connect request truncated at destination")
@@ -246,4 +289,24 @@ func DecodeConnectRequest(data []byte) (*ConnectRequest, error) {
 	req.Destination = string(data[off+2 : off+2+destLen])
 
 	return req, nil
+}
+
+// EncodeControlMessage creates a simple control message with subtype and optional stream ID.
+func EncodeControlMessage(subtype uint8, streamID uint16) []byte {
+	buf := make([]byte, 3)
+	buf[0] = subtype
+	binary.BigEndian.PutUint16(buf[1:3], streamID)
+	return buf
+}
+
+// DecodeControlMessage extracts subtype and streamID from a control packet.
+func DecodeControlMessage(data []byte) (subtype uint8, streamID uint16, err error) {
+	if len(data) < 1 {
+		return 0, 0, fmt.Errorf("control message too short")
+	}
+	subtype = data[0]
+	if len(data) >= 3 {
+		streamID = binary.BigEndian.Uint16(data[1:3])
+	}
+	return subtype, streamID, nil
 }

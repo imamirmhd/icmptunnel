@@ -147,7 +147,7 @@ func (s *Server) receiveLoop() {
 		default:
 		}
 
-		srcIP, icmpType, rawPayload, err := s.socket.Receive()
+		srcIP, icmpType, icmpID, icmpSeq, rawPayload, err := s.socket.Receive()
 		if err != nil {
 			// Don't log timeouts to avoid spam, unless we want to debug headers
 			if err.Error() != "receiving: resource temporarily unavailable" {
@@ -158,6 +158,12 @@ func (s *Server) receiveLoop() {
 
 		// Only process echo requests (from clients) or echo replies (from relay)
 		if icmpType != 8 && icmpType != 0 {
+			continue
+		}
+
+		// If it's a reply (type 0), it must be from a relay with a spoof header.
+		// If relaying is not enabled, we ignore type 0 packets.
+		if icmpType == 0 && !s.cfg.Relay.Enabled {
 			continue
 		}
 
@@ -177,6 +183,10 @@ func (s *Server) receiveLoop() {
 				relayIP = spoofHdr.RelayIP
 				tunnelPayload = data
 			} else {
+				// If relay is enabled but no spoof header, only allow Type 8
+				if icmpType == 0 {
+					continue
+				}
 				realClientIP = srcIP
 				tunnelPayload = rawPayload
 			}
@@ -185,65 +195,111 @@ func (s *Server) receiveLoop() {
 			tunnelPayload = rawPayload
 		}
 
-		// Try defragmenting
-		var decryptedPayload []byte
-		data, complete, fErr := fragBuf.Add(tunnelPayload)
-		if fErr != nil || !complete {
+		var tunnelPkt *icmp.TunnelPacket
+
+		// Handle fragmentation if enabled
+		var reassembledData []byte
+		if s.cfg.Evasion.Fragmentation.Enabled {
+			data, complete, fErr := fragBuf.Add(tunnelPayload)
 			if fErr == nil {
-				continue
-			}
-			decryptedPayload, err = s.encryptor.Decrypt(tunnelPayload)
-			if err != nil {
-				s.log.Debug("Decryption failed from %s: %v", srcIP, err)
-				continue
+				if !complete {
+					continue // Waiting for more fragments
+				}
+				reassembledData = data
+			} else {
+				// Not a fragment or invalid, assume direct payload
+				reassembledData = tunnelPayload
 			}
 		} else {
-			decryptedPayload, err = s.encryptor.Decrypt(data)
-			if err != nil {
-				s.log.Debug("Decryption failed (fragmented) from %s: %v", srcIP, err)
-				continue
-			}
+			reassembledData = tunnelPayload
 		}
 
-		tunnelPkt, err := icmp.DecodeTunnelPacket(decryptedPayload)
+		// Apply other evasion reversal (Padding, Resizing)
+		processedData, err := s.evasion.Unapply([][]byte{reassembledData})
+		if err == nil {
+			reassembledData = processedData
+		} else {
+			// If Unapply fails (e.g. bad padding), it might be an unencrypted ping.
+			// Let it fall through to Decrypt, which will fail, then Ping check.
+			s.log.Debug("Evasion Unapply failed from %s: %v", srcIP, err)
+		}
+
+		var decryptedPayload []byte
+		decryptedPayload, err = s.encryptor.Decrypt(reassembledData)
 		if err != nil {
-			s.log.Debug("Decode tunnel packet failed: %v", err)
+			s.log.Debug("Decryption failed from %s: %v (data len: %d)", srcIP, err, len(reassembledData))
+			// Decryption failed. This might be a standard ping.
+			// Check if the original rawPayload or processedData matches a valid Auth Token prefix.
+			if icmpType == 8 {
+				isValid, _ := s.authValidator.IsValidPrefix(string(rawPayload))
+				if isValid {
+					s.log.Debug("Received valid authorized ping from %s", srcIP)
+					localIP := s.getLocalIP(srcIP)
+					if err := s.socket.SendReply(localIP, srcIP, icmpID, icmpSeq, rawPayload); err != nil {
+						s.log.Error("Failed to send ping reply to %s: %v", srcIP, err)
+					}
+				}
+			}
 			continue
 		}
+
+		tunnelPkt, err = icmp.DecodeTunnelPacket(decryptedPayload)
+		if err != nil {
+			// Decoding failed. Check for Auth Token here too if it's an Echo Request.
+			if icmpType == 8 {
+				isValid, _ := s.authValidator.IsValidPrefix(string(rawPayload))
+				if isValid {
+					s.log.Debug("Received valid authorized ping from %s (decoded flow)", srcIP)
+					localIP := s.getLocalIP(srcIP)
+					if err := s.socket.SendReply(localIP, srcIP, icmpID, icmpSeq, rawPayload); err != nil {
+						s.log.Error("Failed to send ping reply to %s: %v", srcIP, err)
+					}
+				} else {
+					s.log.Debug("Decode tunnel packet failed: %v", err)
+				}
+			} else {
+				s.log.Debug("Decode tunnel packet failed: %v", err)
+			}
+			continue
+		}
+
+		tunnelPkt.ICMPID = icmpID
+		tunnelPkt.ICMPSeq = icmpSeq
 
 		s.handlePacket(realClientIP, srcIP, routeFlag, relayIP, tunnelPkt)
 	}
 }
 
 func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, pkt *icmp.TunnelPacket) {
-	s.log.Debug("Handling packet type %d, session %08x, seq %d", pkt.Type, pkt.SessionID, pkt.SeqNum)
+	s.log.Debug("Handling packet type %d, session %08x, seq %d, icmp_id %d", pkt.Type, pkt.SessionID, pkt.SeqNum, pkt.ICMPID)
 	switch pkt.Type {
 	case icmp.TypeAuth:
-		s.handleAuth(clientIP, srcIP, routeFlag, relayIP, pkt)
-
-	case icmp.TypeData:
-		session := s.sessionMgr.GetSession(pkt.SessionID)
-		if session == nil || !session.Authenticated {
-			s.log.Warn("Data from unauthenticated session %08x", pkt.SessionID)
-			return
-		}
-		s.sessionMgr.TouchSession(pkt.SessionID)
-		s.handleData(clientIP, srcIP, routeFlag, relayIP, session, pkt)
-
-	case icmp.TypeControl:
-		session := s.sessionMgr.GetSession(pkt.SessionID)
-		if session == nil || !session.Authenticated {
-			return
-		}
-		s.sessionMgr.TouchSession(pkt.SessionID)
-		s.handleControl(clientIP, srcIP, routeFlag, relayIP, session, pkt)
+		s.handleAuth(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, pkt)
 
 	case icmp.TypeDiag:
-		s.handleDiag(clientIP, srcIP, routeFlag, relayIP, pkt)
+		s.handleDiag(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, pkt)
+
+	case icmp.TypeData, icmp.TypeControl:
+		session := s.sessionMgr.GetSession(pkt.SessionID)
+		if session == nil || !session.Authenticated {
+			s.log.Warn("Packet from unauthenticated session %08x", pkt.SessionID)
+			return
+		}
+		s.sessionMgr.TouchSession(pkt.SessionID)
+
+		// Reliability layer: sequencing and reordering
+		pkts := session.ProcessIncoming(pkt)
+		for _, p := range pkts {
+			if p.Type == icmp.TypeData {
+				s.handleData(clientIP, srcIP, routeFlag, relayIP, p.ICMPID, p.ICMPSeq, session, p)
+			} else if p.Type == icmp.TypeControl {
+				s.handleControl(clientIP, srcIP, routeFlag, relayIP, p.ICMPID, p.ICMPSeq, session, p)
+			}
+		}
 	}
 }
 
-func (s *Server) handleAuth(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, pkt *icmp.TunnelPacket) {
+func (s *Server) handleAuth(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, icmpID, icmpSeq uint16, pkt *icmp.TunnelPacket) {
 	token := string(pkt.Data)
 	s.log.Info("Auth request from %s (session %08x)", clientIP, pkt.SessionID)
 
@@ -263,13 +319,15 @@ func (s *Server) handleAuth(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 		Type:      icmp.TypeControl,
 		SessionID: pkt.SessionID,
 		SeqNum:    0,
-		Data:      []byte{responseSubtype},
+		Data:      icmp.EncodeControlMessage(responseSubtype, 0),
 	}
 
-	s.sendResponse(clientIP, srcIP, routeFlag, relayIP, responsePkt)
+	if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, responsePkt); err != nil {
+		s.log.Error("Failed to send auth response: %v", err)
+	}
 }
 
-func (s *Server) handleData(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, session *icmp.Session, pkt *icmp.TunnelPacket) {
+func (s *Server) handleData(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, icmpID, icmpSeq uint16, session *icmp.Session, pkt *icmp.TunnelPacket) {
 	streamID, data, err := icmp.DecodeStreamData(pkt.Data)
 	if err != nil {
 		s.log.Error("Decode stream data: %v", err)
@@ -296,45 +354,64 @@ func (s *Server) handleData(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 	}
 }
 
-func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, session *icmp.Session, pkt *icmp.TunnelPacket) {
-	req, err := icmp.DecodeConnectRequest(pkt.Data)
+func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, icmpID, icmpSeq uint16, session *icmp.Session, pkt *icmp.TunnelPacket) {
+	subtype, streamID, err := icmp.DecodeControlMessage(pkt.Data)
 	if err != nil {
-		s.log.Error("Decode connect request: %v", err)
+		s.log.Error("Decode control message: %v", err)
 		return
 	}
 
-	s.log.Info("Connect request: stream=%d proto=%s dest=%s from %s",
-		req.StreamID, req.Protocol, req.Destination, clientIP)
+	switch subtype {
+	case icmp.ControlConnect:
+		req, err := icmp.DecodeConnectRequest(pkt.Data)
+		if err != nil {
+			s.log.Error("Decode connect request: %v", err)
+			return
+		}
 
-	// Establish connection to destination
-	var conn net.Conn
-	switch req.Protocol {
-	case "tcp":
-		conn, err = net.DialTimeout("tcp", req.Destination, 10*time.Second)
-	case "udp":
-		conn, err = net.DialTimeout("udp", req.Destination, 10*time.Second)
-	default:
-		s.log.Error("Unsupported protocol: %s", req.Protocol)
-		return
-	}
+		s.log.Info("Connect request: stream=%d proto=%s dest=%s from %s",
+			req.StreamID, req.Protocol, req.Destination, clientIP)
 
-	if err != nil {
-		s.log.Error("Connect to %s failed: %v", req.Destination, err)
-		return
-	}
+		// Establish connection to destination
+		var conn net.Conn
+		switch req.Protocol {
+		case "tcp":
+			conn, err = net.DialTimeout("tcp", req.Destination, 10*time.Second)
+		case "udp":
+			conn, err = net.DialTimeout("udp", req.Destination, 10*time.Second)
+		default:
+			s.log.Error("Unsupported protocol: %s", req.Protocol)
+			return
+		}
 
-	connKey := fmt.Sprintf("%s:%d", clientIP, req.StreamID)
-	s.connMu.Lock()
-	s.connections[connKey] = conn
-	s.connMu.Unlock()
+		if err != nil {
+			s.log.Error("Connect to %s failed: %v", req.Destination, err)
+			failPkt := &icmp.TunnelPacket{
+				Type:      icmp.TypeControl,
+				SessionID: session.ID,
+				Data:      icmp.EncodeControlMessage(icmp.ControlConnectFail, req.StreamID),
+			}
+			if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, failPkt); err != nil {
+				s.log.Error("Failed to send connect fail: %v", err)
+			}
+			return
+		}
 
-	// Send connect ACK
-	ackPkt := &icmp.TunnelPacket{
-		Type:      icmp.TypeControl,
-		SessionID: session.ID,
-		Data:      []byte{icmp.ControlConnectACK},
-	}
-	s.sendResponse(clientIP, srcIP, routeFlag, relayIP, ackPkt)
+		connKey := fmt.Sprintf("%s:%d", clientIP, req.StreamID)
+		s.connMu.Lock()
+		s.connections[connKey] = conn
+		s.connMu.Unlock()
+
+		// Send connect ACK with streamID
+		ackPkt := &icmp.TunnelPacket{
+			Type:      icmp.TypeControl,
+			SessionID: session.ID,
+			Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, req.StreamID),
+		}
+		if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt); err != nil {
+			s.log.Error("Failed to send connect ACK: %v", err)
+		}
+
 
 	// Start reading from destination and sending back
 	s.wg.Add(1)
@@ -347,7 +424,8 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 			conn.Close()
 		}()
 
-		buf := make([]byte, 32*1024)
+		maxData := s.calculateMaxStreamData()
+		buf := make([]byte, maxData)
 		for {
 			select {
 			case <-s.done:
@@ -360,6 +438,15 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 				if err != io.EOF {
 					s.log.Error("Read from %s: %v", req.Destination, err)
 				}
+				// Inform client about close
+				closePkt := &icmp.TunnelPacket{
+					Type:      icmp.TypeControl,
+					SessionID: session.ID,
+					Data:      icmp.EncodeControlMessage(icmp.ControlClose, req.StreamID),
+				}
+				if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, 0, 0, closePkt); err != nil {
+					s.log.Error("Failed to send close notification: %v", err)
+				}
 				return
 			}
 
@@ -371,12 +458,46 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 				Data:      streamData,
 			}
 
-			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, dataPkt)
+			// Use same ID/Seq as request? No, async data sends need new ID/Seq?
+			// Actually, for unsolicited pushes (like data from destination), we are initiating the exchange.
+			// The original request ID/Seq are stale. We should generate new ones or use 0 to let socket randomize.
+			// Use 0, 0 to randomize.
+			if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, 0, 0, dataPkt); err != nil {
+				s.log.Error("Send response to %s failed: %v", clientIP, err)
+				return
+			}
 		}
 	}()
+	case icmp.ControlClose:
+		connKey := fmt.Sprintf("%s:%d", clientIP, streamID)
+		s.connMu.Lock()
+		if conn, ok := s.connections[connKey]; ok {
+			conn.Close()
+			delete(s.connections, connKey)
+			s.log.Info("Closed connection for stream %s", connKey)
+		}
+		s.connMu.Unlock()
+
+	case icmp.ControlHeartbeat:
+		// Just acknowledge activity
+
+	case icmp.ControlACK:
+		// This is an ACK for a packet we sent. No action needed on server side.
+		// The client-side logic for pending ACKs would go here if this were client.go
+	}
+
+	// Always send ACK for control messages except ACKs themselves
+	if subtype != icmp.ControlACK {
+		ackPkt := &icmp.TunnelPacket{
+			Type:      icmp.TypeControl,
+			SessionID: session.ID,
+			Data:      icmp.EncodeControlMessage(icmp.ControlACK, pkt.SeqNum),
+		}
+		s.sendResponse(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, ackPkt)
+	}
 }
 
-func (s *Server) handleDiag(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, pkt *icmp.TunnelPacket) {
+func (s *Server) handleDiag(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, icmpID, icmpSeq uint16, pkt *icmp.TunnelPacket) {
 	// Echo back diagnostic data with server timestamp
 	responsePkt := &icmp.TunnelPacket{
 		Type:      icmp.TypeDiag,
@@ -384,23 +505,45 @@ func (s *Server) handleDiag(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 		SeqNum:    pkt.SeqNum,
 		Data:      pkt.Data,
 	}
-	s.sendResponse(clientIP, srcIP, routeFlag, relayIP, responsePkt)
+	if err := s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, responsePkt); err != nil {
+		s.log.Error("Failed to send diag response: %v", err)
+	}
 }
 
-func (s *Server) sendResponse(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, pkt *icmp.TunnelPacket) {
+func (s *Server) calculateMaxStreamData() int {
+	// Socket.Send check: 20 (IP) + 8 (ICMP) + len(payload) > s.maxPacketSize + 20
+	// So len(payload) max is s.maxPacketSize - 8.
+	room := s.cfg.ICMP.MaxPacketSize - 8
+
+	// Subtract Evasion overhead
+	room -= s.evasion.Overhead()
+
+	// Subtract Encryption overhead
+	room -= s.encryptor.Overhead()
+
+	// Subtract Tunnel header (9) and Stream Data header (2)
+	room -= icmp.TunnelHeaderSize
+	room -= 2 // StreamDataHeaderSize
+
+	if room < 64 {
+		room = 64 // Minimum safety
+	}
+	s.log.Debug("Calculated max stream data size: %d", room)
+	return room
+}
+
+func (s *Server) sendResponse(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, icmpID, icmpSeq uint16, pkt *icmp.TunnelPacket) error {
 	payload := pkt.Encode()
 
 	encrypted, err := s.encryptor.Encrypt(payload)
 	if err != nil {
-		s.log.Error("Encrypt response: %v", err)
-		return
+		return fmt.Errorf("encrypt: %w", err)
 	}
 
 	// Apply evasion
 	packets, err := s.evasion.Apply(encrypted)
 	if err != nil {
-		s.log.Error("Evasion apply: %v", err)
-		return
+		return fmt.Errorf("evasion: %w", err)
 	}
 
 	for _, p := range packets {
@@ -417,15 +560,24 @@ func (s *Server) sendResponse(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 		}
 
 		// Use the server's local IP, send reply to client/relay
-		localIP := net.ParseIP(s.cfg.Listen)
-		if localIP == nil || localIP.Equal(net.IPv4zero) {
-			localIP = getOutboundIP(destIP)
+		localIP := s.getLocalIP(destIP)
+		if localIP == nil || localIP.IsUnspecified() {
+			return fmt.Errorf("could not find local IP")
 		}
 
-		if err := s.socket.SendReply(localIP, destIP, p); err != nil {
-			s.log.Error("Send response: %v", err)
+		if err := s.socket.SendReply(localIP, destIP, icmpID, icmpSeq, p); err != nil {
+			return fmt.Errorf("socket send: %w", err)
 		}
 	}
+	return nil
+}
+
+func (s *Server) getLocalIP(destIP net.IP) net.IP {
+	localIP := net.ParseIP(s.cfg.Listen)
+	if localIP == nil || localIP.Equal(net.IPv4zero) || localIP.IsUnspecified() {
+		localIP = getOutboundIP(destIP)
+	}
+	return localIP
 }
 
 func (s *Server) disableEchoReply() {

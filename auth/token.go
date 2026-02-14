@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -74,6 +75,17 @@ func (v *Validator) IsValid(token string) bool {
 		}
 	}
 	return false
+}
+
+// IsValidPrefix checks if any authorized token is a prefix of the provided payload.
+// Returns success boolean and the length of the matched token.
+func (v *Validator) IsValidPrefix(payload string) (bool, int) {
+	for _, t := range v.tokens {
+		if strings.HasPrefix(payload, t) {
+			return true, len(t)
+		}
+	}
+	return false, 0
 }
 
 // Verify performs HMAC-based challenge-response verification.

@@ -63,3 +63,8 @@ func (c *ChaChaEncryptor) Decrypt(ciphertext []byte) ([]byte, error) {
 func (c *ChaChaEncryptor) Name() string {
 	return "chacha20-poly1305"
 }
+
+// Overhead returns the encryption overhead in bytes (nonce + tag).
+func (c *ChaChaEncryptor) Overhead() int {
+	return c.aead.NonceSize() + c.aead.Overhead()
+}

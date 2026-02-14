@@ -66,3 +66,8 @@ func (a *AESEncryptor) Decrypt(ciphertext []byte) ([]byte, error) {
 func (a *AESEncryptor) Name() string {
 	return "aes-256-gcm"
 }
+
+// Overhead returns the encryption overhead in bytes (nonce + tag).
+func (a *AESEncryptor) Overhead() int {
+	return a.gcm.NonceSize() + a.gcm.Overhead()
+}

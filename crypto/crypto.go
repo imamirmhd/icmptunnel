@@ -8,6 +8,7 @@ type Encryptor interface {
 	Encrypt(plaintext []byte) ([]byte, error)
 	Decrypt(ciphertext []byte) ([]byte, error)
 	Name() string
+	Overhead() int
 }
 
 // NewEncryptor creates a new Encryptor based on the method name.
@@ -30,3 +31,4 @@ type NopEncryptor struct{}
 func (n *NopEncryptor) Encrypt(plaintext []byte) ([]byte, error)   { return plaintext, nil }
 func (n *NopEncryptor) Decrypt(ciphertext []byte) ([]byte, error) { return ciphertext, nil }
 func (n *NopEncryptor) Name() string                               { return "none" }
+func (n *NopEncryptor) Overhead() int                             { return 0 }

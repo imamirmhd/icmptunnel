@@ -35,6 +35,12 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
+	// Override log level if flag provided
+	logLevel, _ := cmd.Root().PersistentFlags().GetString("log-level")
+	if logLevel != "" {
+		cfg.Logging.Level = logLevel
+	}
+
 	if dryRun {
 		fmt.Println("Configuration is valid.")
 		fmt.Printf("  Listen: %s\n", cfg.Listen)

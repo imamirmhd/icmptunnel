@@ -80,24 +80,4 @@ func ExtractSpoofedPayload(payload []byte) (*SpoofHeader, []byte, error) {
 	return header, tunnelData, nil
 }
 
-// StreamDataHeader wraps stream data with a stream ID.
-// Wire format: [2B stream_id][NB data]
-const StreamDataHeaderSize = 2
 
-// EncodeStreamData wraps data with a stream ID for multiplexing.
-func EncodeStreamData(streamID uint16, data []byte) []byte {
-	buf := make([]byte, StreamDataHeaderSize+len(data))
-	binary.BigEndian.PutUint16(buf[0:2], streamID)
-	copy(buf[2:], data)
-	return buf
-}
-
-// DecodeStreamData extracts the stream ID and data.
-func DecodeStreamData(payload []byte) (streamID uint16, data []byte, err error) {
-	if len(payload) < StreamDataHeaderSize {
-		return 0, nil, fmt.Errorf("stream data too short")
-	}
-	streamID = binary.BigEndian.Uint16(payload[0:2])
-	data = payload[2:]
-	return streamID, data, nil
-}

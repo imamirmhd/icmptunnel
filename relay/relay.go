@@ -84,7 +84,7 @@ func (s *Server) receiveLoop() {
 		default:
 		}
 
-		srcIP, icmpType, payload, err := s.socket.Receive()
+		srcIP, icmpType, id, seq, payload, err := s.socket.Receive()
 		if err != nil {
 			continue
 		}
@@ -112,7 +112,7 @@ func (s *Server) receiveLoop() {
 		// will be sent to the main server by the kernel.
 		// We explicitly send an echo reply for better control.
 		localIP := getLocalIP()
-		if err := s.socket.SendReply(localIP, srcIP, payload); err != nil {
+		if err := s.socket.SendReply(localIP, srcIP, id, seq, payload); err != nil {
 			s.log.Error("Failed to relay: %v", err)
 		}
 	}

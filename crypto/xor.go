@@ -36,3 +36,8 @@ func (x *XOREncryptor) Decrypt(ciphertext []byte) ([]byte, error) {
 func (x *XOREncryptor) Name() string {
 	return "xor"
 }
+
+// Overhead returns the encryption overhead (0 for XOR).
+func (x *XOREncryptor) Overhead() int {
+	return 0
+}

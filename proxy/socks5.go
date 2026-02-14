@@ -30,23 +30,25 @@ type Socks5Server struct {
 	onConnect  ConnectHandler
 	onData     DataHandler
 	onClose    CloseHandler
+	maxDataSize int
 	log        *logger.Logger
 	wg         sync.WaitGroup
 	done       chan struct{}
 }
 
 // NewSocks5Server creates a new SOCKS5 proxy server.
-func NewSocks5Server(listenAddr, username, password string,
+func NewSocks5Server(listenAddr, username, password string, maxDataSize int,
 	onConnect ConnectHandler, onData DataHandler, onClose CloseHandler) *Socks5Server {
 	return &Socks5Server{
-		listenAddr: listenAddr,
-		username:   username,
-		password:   password,
-		onConnect:  onConnect,
-		onData:     onData,
-		onClose:    onClose,
-		log:        logger.Default().WithComponent("socks5"),
-		done:       make(chan struct{}),
+		listenAddr:  listenAddr,
+		username:    username,
+		password:    password,
+		onConnect:   onConnect,
+		onData:      onData,
+		onClose:     onClose,
+		maxDataSize: maxDataSize,
+		log:         logger.Default().WithComponent("socks5"),
+		done:        make(chan struct{}),
 	}
 }
 
@@ -130,7 +132,11 @@ func (s *Socks5Server) handleConnection(conn net.Conn) {
 	// Client -> Tunnel
 	go func() {
 		defer func() { doneCh <- struct{}{} }()
-		buf := make([]byte, 32*1024)
+		bufSize := s.maxDataSize
+		if bufSize <= 0 {
+			bufSize = 32 * 1024
+		}
+		buf := make([]byte, bufSize)
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {

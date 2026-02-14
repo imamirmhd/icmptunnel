@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/user/icmptunnel/config"
 	"github.com/user/icmptunnel/diag"
 )
 
@@ -24,6 +25,7 @@ var pingCmd = &cobra.Command{
 			return err
 		}
 		defer d.Close()
+		loadToken(d, cmd)
 		_, err = d.Ping(args[0], count)
 		return err
 	},
@@ -40,6 +42,7 @@ var throughputCmd = &cobra.Command{
 			return err
 		}
 		defer d.Close()
+		loadToken(d, cmd)
 		_, err = d.Throughput(args[0], duration)
 		return err
 	},
@@ -56,6 +59,7 @@ var lossCmd = &cobra.Command{
 			return err
 		}
 		defer d.Close()
+		loadToken(d, cmd)
 		_, err = d.PacketLoss(args[0], count)
 		return err
 	},
@@ -71,6 +75,7 @@ var detectCmd = &cobra.Command{
 			return err
 		}
 		defer d.Close()
+		loadToken(d, cmd)
 		_, err = d.DPIDetect(args[0])
 		return err
 	},
@@ -100,8 +105,23 @@ var statusCmd = &cobra.Command{
 			return err
 		}
 		defer d.Close()
+		loadToken(d, cmd)
 		return d.StatusCheck(args[0])
 	},
+}
+
+func loadToken(d *diag.Diagnostics, cmd *cobra.Command) {
+	cfgPath, _ := cmd.Flags().GetString("config")
+	if cfgPath == "" {
+		cfgPath, _ = cmd.Root().PersistentFlags().GetString("config")
+	}
+
+	if cfgPath != "" {
+		clientCfg, err := config.LoadClientConfig(cfgPath)
+		if err == nil {
+			d.SetAuthToken(clientCfg.AuthToken)
+		}
+	}
 }
 
 func init() {

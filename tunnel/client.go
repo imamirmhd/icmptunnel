@@ -29,11 +29,15 @@ type Client struct {
 	localAddr  net.IP
 	streams    map[uint16]chan []byte
 	streamsMu  sync.RWMutex
+	pendingStreams map[uint16]chan error
+	pendingAcks    map[uint16]chan struct{}
+	pendingMu      sync.Mutex
 	socks5     []*proxy.Socks5Server
 	forwarders []*proxy.Forwarder
-	log        *logger.Logger
-	done       chan struct{}
-	wg         sync.WaitGroup
+	lastServerActivity time.Time
+	log                *logger.Logger
+	done               chan struct{}
+	wg                 sync.WaitGroup
 }
 
 // NewClient creates a new tunnel client.
@@ -86,8 +90,10 @@ func NewClient(cfg *config.ClientConfig) (*Client, error) {
 		evasion:    ev,
 		sessionMgr: icmp.NewSessionManager(5 * time.Minute),
 		serverAddr: serverAddr,
-		streams:    make(map[uint16]chan []byte),
-		log:        log,
+		streams:        make(map[uint16]chan []byte),
+		pendingStreams: make(map[uint16]chan error),
+		pendingAcks:    make(map[uint16]chan struct{}),
+		log:            log,
 		done:       make(chan struct{}),
 	}, nil
 }
@@ -108,13 +114,10 @@ func (c *Client) Start() error {
 	}
 	c.log.Info("Authentication successful")
 
-	// Start receiving ICMP packets
-	c.wg.Add(1)
-	go c.receiveLoop()
-
 	// Start SOCKS5 proxies
+	maxData := c.calculateMaxStreamData()
 	for _, scfg := range c.cfg.Socks5 {
-		s := proxy.NewSocks5Server(scfg.Listen, scfg.Username, scfg.Password,
+		s := proxy.NewSocks5Server(scfg.Listen, scfg.Username, scfg.Password, maxData,
 			c.handleConnect, c.handleData, c.handleClose)
 		if err := s.Start(); err != nil {
 			return fmt.Errorf("starting SOCKS5 proxy on %s: %w", scfg.Listen, err)
@@ -125,7 +128,7 @@ func (c *Client) Start() error {
 
 	// Start forwarders
 	for _, fcfg := range c.cfg.Forwards {
-		f := proxy.NewForwarder(fcfg.Listen, fcfg.Destination, fcfg.Protocol,
+		f := proxy.NewForwarder(fcfg.Listen, fcfg.Destination, fcfg.Protocol, maxData,
 			c.handleConnect, c.handleData, c.handleClose)
 		if err := f.Start(); err != nil {
 			return fmt.Errorf("starting forwarder %s->%s: %w", fcfg.Listen, fcfg.Destination, err)
@@ -133,6 +136,10 @@ func (c *Client) Start() error {
 		c.forwarders = append(c.forwarders, f)
 		c.log.Info("Forwarder started: %s -> %s (%s)", fcfg.Listen, fcfg.Destination, fcfg.Protocol)
 	}
+
+	// Start heartbeat and health check loop
+	c.wg.Add(1)
+	go c.heartbeatLoop()
 
 	return nil
 }
@@ -180,12 +187,30 @@ func (c *Client) authenticate() error {
 	// Wait for auth response
 	deadline := time.Now().Add(auth.AuthTimeout)
 	for time.Now().Before(deadline) {
-		_, _, rawPayload, err := c.socket.Receive()
+		_, _, _, _, rawPayload, err := c.socket.Receive()
 		if err != nil {
 			continue
 		}
 
-		decrypted, err := c.encryptor.Decrypt(rawPayload)
+		// Handle fragmentation and evasion
+		var reassembledData []byte
+		if c.cfg.Evasion.Fragmentation.Enabled {
+			// Note: authenticate loop doesn't currently handle stateful fragmentation reassembly
+			// since it's a simple synchronous loop. But adding standard Unapply for now.
+			processed, err := c.evasion.Unapply([][]byte{rawPayload})
+			if err != nil {
+				continue
+			}
+			reassembledData = processed
+		} else {
+			processed, err := c.evasion.Unapply([][]byte{rawPayload})
+			if err != nil {
+				continue
+			}
+			reassembledData = processed
+		}
+
+		decrypted, err := c.encryptor.Decrypt(reassembledData)
 		if err != nil {
 			continue
 		}
@@ -212,10 +237,15 @@ func (c *Client) authenticate() error {
 func (c *Client) handleConnect(protocol, destination string) (uint16, chan []byte, error) {
 	streamID := icmp.GenerateStreamID()
 	responseChan := make(chan []byte, 256)
+	statusChan := make(chan error, 1)
 
 	c.streamsMu.Lock()
 	c.streams[streamID] = responseChan
 	c.streamsMu.Unlock()
+
+	c.pendingMu.Lock()
+	c.pendingStreams[streamID] = statusChan
+	c.pendingMu.Unlock()
 
 	// Send connect request to server
 	req := &icmp.ConnectRequest{
@@ -233,10 +263,23 @@ func (c *Client) handleConnect(protocol, destination string) (uint16, chan []byt
 	}
 
 	if err := c.sendTunnelPacket(pkt); err != nil {
+		c.handleClose(streamID)
 		return 0, nil, err
 	}
 
-	return streamID, responseChan, nil
+	// Wait for ACK
+	select {
+	case err := <-statusChan:
+		if err != nil {
+			c.handleClose(streamID)
+			return 0, nil, err
+		}
+		c.log.Info("Stream %d established to %s", streamID, destination)
+		return streamID, responseChan, nil
+	case <-time.After(10 * time.Second):
+		c.handleClose(streamID)
+		return 0, nil, fmt.Errorf("connect timeout")
+	}
 }
 
 func (c *Client) handleData(streamID uint16, data []byte) error {
@@ -257,8 +300,51 @@ func (c *Client) handleClose(streamID uint16) {
 	if ch, ok := c.streams[streamID]; ok {
 		close(ch)
 		delete(c.streams, streamID)
+
+		// Inform server
+		closePkt := &icmp.TunnelPacket{
+			Type:      icmp.TypeControl,
+			SessionID: c.session.ID,
+			Data:      icmp.EncodeControlMessage(icmp.ControlClose, streamID),
+		}
+		c.sendPacketReliable(closePkt, 2*time.Second, 3)
 	}
 	c.streamsMu.Unlock()
+
+	c.pendingMu.Lock()
+	delete(c.pendingStreams, streamID)
+	c.pendingMu.Unlock()
+}
+
+func (c *Client) sendPacketReliable(pkt *icmp.TunnelPacket, timeout time.Duration, maxRetries int) error {
+	ackChan := make(chan struct{}, 1)
+	
+	for i := 0; i <= maxRetries; i++ {
+		// New sequence number each time? 
+		// Actually for reliability of a single logical command, we should use same SeqNum if it's the same packet.
+		// Use SeqNum as key
+		c.pendingMu.Lock()
+		c.pendingAcks[pkt.SeqNum] = ackChan
+		c.pendingMu.Unlock()
+
+		if err := c.sendTunnelPacket(pkt); err != nil {
+			return err
+		}
+
+		select {
+		case <-ackChan:
+			return nil
+		case <-time.After(timeout):
+			// retry
+			c.log.Debug("Packet %d timeout, retry %d", pkt.SeqNum, i+1)
+		}
+	}
+
+	c.pendingMu.Lock()
+	delete(c.pendingAcks, pkt.SeqNum)
+	c.pendingMu.Unlock()
+
+	return fmt.Errorf("packet %d failed after %d retries", pkt.SeqNum, maxRetries)
 }
 
 func (c *Client) sendTunnelPacket(pkt *icmp.TunnelPacket) error {
@@ -306,10 +392,10 @@ func (c *Client) sendICMP(payload []byte) error {
 			return err
 		}
 		relayIP := net.ParseIP(c.cfg.Spoof.RelayAddr)
-		return c.socket.SendEcho(c.serverAddr, relayIP, spoofedPayload)
+		return c.socket.SendEcho(c.serverAddr, relayIP, 0, 0, spoofedPayload)
 	}
 
-	return c.socket.SendEcho(c.localAddr, c.serverAddr, payload)
+	return c.socket.SendEcho(c.localAddr, c.serverAddr, 0, 0, payload)
 }
 
 func (c *Client) receiveLoop() {
@@ -324,35 +410,39 @@ func (c *Client) receiveLoop() {
 		default:
 		}
 
-		_, _, rawPayload, err := c.socket.Receive()
+		_, _, _, _, rawPayload, err := c.socket.Receive()
 		if err != nil {
 			continue
 		}
 
-		// Try defragmenting
-		var decryptedPayload []byte
-		if c.evasion != nil {
+		// Handle fragmentation if enabled
+		var reassembledData []byte
+		if c.cfg.Evasion.Fragmentation.Enabled {
 			data, complete, err := fragBuf.Add(rawPayload)
-			if err != nil || !complete {
-				if err == nil {
+			if err == nil {
+				if !complete {
 					continue // Waiting for more fragments
 				}
-				// Not a fragment, try direct
-				decryptedPayload, err = c.encryptor.Decrypt(rawPayload)
-				if err != nil {
-					continue
-				}
+				reassembledData = data
 			} else {
-				decryptedPayload, err = c.encryptor.Decrypt(data)
-				if err != nil {
-					continue
-				}
+				// Not a fragment, use direct payload
+				reassembledData = rawPayload
 			}
 		} else {
-			decryptedPayload, err = c.encryptor.Decrypt(rawPayload)
-			if err != nil {
-				continue
-			}
+			reassembledData = rawPayload
+		}
+
+		// Apply other evasion reversal (Padding, Resizing)
+		processedData, err := c.evasion.Unapply([][]byte{reassembledData})
+		if err == nil {
+			reassembledData = processedData
+		} else {
+			c.log.Debug("Evasion Unapply failed: %v", err)
+		}
+
+		decryptedPayload, err := c.encryptor.Decrypt(reassembledData)
+		if err != nil {
+			continue
 		}
 
 		tunnelPkt, err := icmp.DecodeTunnelPacket(decryptedPayload)
@@ -364,25 +454,135 @@ func (c *Client) receiveLoop() {
 			continue
 		}
 
-		switch tunnelPkt.Type {
-		case icmp.TypeData:
-			streamID, data, err := icmp.DecodeStreamData(tunnelPkt.Data)
-			if err != nil {
-				continue
-			}
-			c.streamsMu.RLock()
-			if ch, ok := c.streams[streamID]; ok {
-				select {
-				case ch <- data:
-				default:
-					c.log.Warn("Stream %d buffer full, dropping data", streamID)
+		c.lastServerActivity = time.Now()
+
+		// Reliability layer: sequencing and reordering
+		pkts := c.session.ProcessIncoming(tunnelPkt)
+		for _, p := range pkts {
+			switch p.Type {
+			case icmp.TypeData:
+				streamID, data, err := icmp.DecodeStreamData(p.Data)
+				if err != nil {
+					continue
+				}
+				c.streamsMu.RLock()
+				if ch, ok := c.streams[streamID]; ok {
+					select {
+					case ch <- data:
+					default:
+						c.log.Warn("Stream %d buffer full, dropping data", streamID)
+					}
+				}
+				c.streamsMu.RUnlock()
+
+			case icmp.TypeControl:
+				subtype, streamID, err := icmp.DecodeControlMessage(p.Data)
+				if err != nil {
+					continue
+				}
+
+				switch subtype {
+				case icmp.ControlConnectACK:
+					c.pendingMu.Lock()
+					if ch, ok := c.pendingStreams[streamID]; ok {
+						ch <- nil
+						delete(c.pendingStreams, streamID)
+					}
+					c.pendingMu.Unlock()
+
+				case icmp.ControlConnectFail:
+					c.pendingMu.Lock()
+					if ch, ok := c.pendingStreams[streamID]; ok {
+						ch <- fmt.Errorf("server failed to connect to destination")
+						delete(c.pendingStreams, streamID)
+					}
+					c.pendingMu.Unlock()
+
+				case icmp.ControlClose:
+					c.handleClose(streamID)
+
+				case icmp.ControlHeartbeat:
+					// Handled by update to LastActivity in ProcessIncoming/TouchSession
+
+				case icmp.ControlACK:
+					// For ControlACK, streamID field carries the original SeqNum being ACKed
+					c.pendingMu.Lock()
+					if ch, ok := c.pendingAcks[streamID]; ok {
+						close(ch)
+						delete(c.pendingAcks, streamID)
+					}
+					c.pendingMu.Unlock()
 				}
 			}
-			c.streamsMu.RUnlock()
+		}
+	}
+}
 
-		case icmp.TypeControl:
-			// Handle control messages
-			c.log.Debug("Received control message")
+func (c *Client) heartbeatLoop() {
+	defer c.wg.Done()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	// Start receiveLoop once
+	c.wg.Add(1)
+	go c.receiveLoop()
+
+	// Initial activity
+	c.lastServerActivity = time.Now()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			// Send heartbeat
+			pkt := &icmp.TunnelPacket{
+				Type:      icmp.TypeControl,
+				SessionID: c.session.ID,
+				SeqNum:    c.session.GetNextSeq(),
+				Data:      icmp.EncodeControlMessage(icmp.ControlHeartbeat, 0),
+			}
+			if err := c.sendTunnelPacket(pkt); err != nil {
+				c.log.Error("Heartbeat send failed: %v", err)
+			}
+
+			// Check for timeout
+			if time.Since(c.lastServerActivity) > 30*time.Second {
+				c.log.Warn("Tunnel timeout, attempting to reconnect...")
+				c.reconnect()
+			}
+		}
+	}
+}
+
+func (c *Client) reconnect() {
+	backoff := 1 * time.Second
+	maxBackoff := 60 * time.Second
+
+	for {
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
+		c.log.Info("Reconnecting... (backoff %v)", backoff)
+		
+		// Create new session
+		newSession := icmp.NewSessionManager(5 * time.Minute).CreateSession(c.serverAddr)
+		newSession.AuthToken = c.cfg.AuthToken
+		c.session = newSession
+
+		if err := c.authenticate(); err == nil {
+			c.log.Info("Reconnected successfully")
+			c.lastServerActivity = time.Now()
+			return
+		}
+
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
 		}
 	}
 }
@@ -400,4 +600,26 @@ func getOutboundIP(target net.IP) net.IP {
 	defer conn.Close()
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 	return localAddr.IP
+}
+
+func (c *Client) calculateMaxStreamData() int {
+	// Socket.Send check: 20 (IP) + 8 (ICMP) + len(payload) > s.maxPacketSize + 20
+	// So len(payload) max is s.maxPacketSize - 8.
+	room := c.cfg.ICMP.MaxPacketSize - 8
+
+	// Subtract Evasion overhead
+	room -= c.evasion.Overhead()
+
+	// Subtract Encryption overhead
+	room -= c.encryptor.Overhead()
+
+	// Subtract Tunnel header (9) and Stream Data header (2)
+	room -= icmp.TunnelHeaderSize
+	room -= 2 // StreamDataHeaderSize
+
+	if room < 64 {
+		room = 64 // Minimum safety
+	}
+	c.log.Debug("Calculated max stream data size: %d", room)
+	return room
 }

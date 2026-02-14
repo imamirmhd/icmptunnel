@@ -29,7 +29,31 @@ const (
 	ControlAuthFail   uint8 = 0x04
 	ControlConnect    uint8 = 0x05
 	ControlConnectACK uint8 = 0x06
+	ControlConnectFail uint8 = 0x07
+	ControlACK        uint8 = 0x08
 )
+
+// StreamDataHeader wraps stream data with a stream ID.
+// Wire format: [2B stream_id][NB data]
+const StreamDataHeaderSize = 2
+
+// EncodeStreamData wraps data with a stream ID for multiplexing.
+func EncodeStreamData(streamID uint16, data []byte) []byte {
+	buf := make([]byte, StreamDataHeaderSize+len(data))
+	binary.BigEndian.PutUint16(buf[0:2], streamID)
+	copy(buf[2:], data)
+	return buf
+}
+
+// DecodeStreamData extracts the stream ID and data.
+func DecodeStreamData(payload []byte) (streamID uint16, data []byte, err error) {
+	if len(payload) < StreamDataHeaderSize {
+		return 0, nil, fmt.Errorf("stream data too short")
+	}
+	streamID = binary.BigEndian.Uint16(payload[0:2])
+	data = payload[2:]
+	return streamID, data, nil
+}
 
 // TunnelHeaderSize is the size of the tunnel packet header.
 const TunnelHeaderSize = 9 // 1 flags + 4 session_id + 2 seq_num + 2 data_len
@@ -54,6 +78,10 @@ type TunnelPacket struct {
 	SessionID uint32 // Session identifier
 	SeqNum    uint16 // Sequence number
 	Data      []byte // Payload data
+
+	// In-memory metadata (not encoded)
+	ICMPID  uint16
+	ICMPSeq uint16
 }
 
 // Encode serializes a TunnelPacket into bytes for transmission.

@@ -16,6 +16,7 @@ type Forwarder struct {
 	onConnect   ConnectHandler
 	onData      DataHandler
 	onClose     CloseHandler
+	maxDataSize int
 	listener    net.Listener
 	udpConn     *net.UDPConn
 	log         *logger.Logger
@@ -24,7 +25,7 @@ type Forwarder struct {
 }
 
 // NewForwarder creates a new port forwarder.
-func NewForwarder(listen, destination, protocol string,
+func NewForwarder(listen, destination, protocol string, maxDataSize int,
 	onConnect ConnectHandler, onData DataHandler, onClose CloseHandler) *Forwarder {
 	return &Forwarder{
 		listen:      listen,
@@ -33,6 +34,7 @@ func NewForwarder(listen, destination, protocol string,
 		onConnect:   onConnect,
 		onData:      onData,
 		onClose:     onClose,
+		maxDataSize: maxDataSize,
 		log:         logger.Default().WithComponent("forward"),
 		done:        make(chan struct{}),
 	}
@@ -111,7 +113,11 @@ func (f *Forwarder) handleTCPConn(conn net.Conn) {
 	// Local -> Tunnel
 	go func() {
 		defer func() { doneCh <- struct{}{} }()
-		buf := make([]byte, 32*1024)
+		bufSize := f.maxDataSize
+		if bufSize <= 0 {
+			bufSize = 32 * 1024
+		}
+		buf := make([]byte, bufSize)
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
@@ -169,7 +175,11 @@ func (f *Forwarder) startUDP() error {
 	f.wg.Add(1)
 	go func() {
 		defer f.wg.Done()
-		buf := make([]byte, 65535)
+		bufSize := f.maxDataSize
+		if bufSize <= 0 {
+			bufSize = 65535
+		}
+		buf := make([]byte, bufSize)
 		for {
 			select {
 			case <-f.done:

@@ -144,3 +144,19 @@ func (m *Manager) ManipulateChecksum(icmpPacket []byte) []byte {
 	}
 	return icmpPacket
 }
+
+// Overhead returns the maximum additional bytes added by enabled evasion techniques.
+func (m *Manager) Overhead() int {
+	overhead := 0
+	if m.padder != nil {
+		overhead += m.padder.maxSize + 1
+	}
+	if m.adaptiveSizer != nil {
+		// Adaptive sizer pads to its own maxSize, but also adds a 2-byte header.
+		// However, it usually encapsulates the whole thing.
+		// For safety, let's say it adds at least its header.
+		overhead += 2
+	}
+	// Mimicry/Jitter/Checksum don't add size to the payload.
+	return overhead
+}
