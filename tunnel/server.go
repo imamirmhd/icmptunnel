@@ -27,6 +27,7 @@ type Server struct {
 	sessionMgr *icmp.SessionManager
 	authValidator *auth.Validator
 	connections map[string]net.Conn // streamKey -> connection
+	connecting map[string]bool     // streamKey -> currently connecting?
 	connMu     sync.RWMutex
 	log        *logger.Logger
 	done       chan struct{}
@@ -84,6 +85,7 @@ func NewServer(cfg *config.ServerConfig) (*Server, error) {
 		sessionMgr:    icmp.NewSessionManager(5 * time.Minute),
 		authValidator: validator,
 		connections:   make(map[string]net.Conn),
+		connecting:    make(map[string]bool),
 		log:           log,
 		done:          make(chan struct{}),
 	}, nil
@@ -493,8 +495,46 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 
 	switch subtype {
 	case icmp.ControlConnect:
+		connKey := fmt.Sprintf("%s:%d", clientIP, streamID)
+		
+		s.connMu.RLock()
+		_, exists := s.connections[connKey]
+		s.connMu.RUnlock()
+		
+		if exists {
+			s.log.Debug("Connection for stream %s already exists, re-acknowledging", connKey)
+			ackPkt := &icmp.TunnelPacket{
+				Type:      icmp.TypeControl,
+				SessionID: session.ID,
+				SeqNum:    session.GetNextSeq(),
+				Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, uint32(streamID)),
+			}
+			session.RecordSent(ackPkt)
+			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
+			return
+		}
+
+		// Prevent multiple concurrent dial attempts for the same stream
+		s.connMu.Lock()
+		if s.connecting == nil {
+			s.connecting = make(map[string]bool)
+		}
+		if s.connecting[connKey] {
+			s.connMu.Unlock()
+			s.log.Debug("Connection for stream %s is already in progress, skipping", connKey)
+			return
+		}
+		s.connecting[connKey] = true
+		s.connMu.Unlock()
+
 		// Handle Connect asynchronously to avoid blocking the receiver loop
 		go func() {
+			defer func() {
+				s.connMu.Lock()
+				delete(s.connecting, connKey)
+				s.connMu.Unlock()
+			}()
+
 			req, err := icmp.DecodeConnectRequest(pkt.Data)
 			if err != nil {
 				s.log.Error("Decode connect request: %v", err)
@@ -503,25 +543,6 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 
 			s.log.Info("Connect request: stream=%d proto=%s dest=%s from %s",
 				req.StreamID, req.Protocol, req.Destination, clientIP)
-
-			connKey := fmt.Sprintf("%s:%d", clientIP, req.StreamID)
-			
-			s.connMu.RLock()
-			_, exists := s.connections[connKey]
-			s.connMu.RUnlock()
-			
-			if exists {
-				s.log.Debug("Connection for stream %s already exists, re-acknowledging", connKey)
-				ackPkt := &icmp.TunnelPacket{
-					Type:      icmp.TypeControl,
-					SessionID: session.ID,
-					SeqNum:    session.GetNextSeq(),
-					Data:      icmp.EncodeControlMessage(icmp.ControlConnectACK, uint32(req.StreamID)),
-				}
-				session.RecordSent(ackPkt)
-				s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
-				return
-			}
 
 			// Establish connection to destination
 			var conn net.Conn
@@ -731,13 +752,26 @@ func (s *Server) runDownlink(session *icmp.Session, stream *icmp.Stream, conn ne
 		}
 
 		s.log.Debug("Downlink: Read %d bytes from %s for stream %d", n, req.Destination, req.StreamID)
+		
+		finalData := icmp.EncodeStreamData(req.StreamID, buf[:n])
+		var flags uint8
+		if s.cfg.Transport.Compression {
+			compressed := session.Compress(finalData)
+			if len(compressed) < len(finalData) {
+				finalData = compressed
+				flags |= icmp.FlagCompressed
+			}
+		}
+
 		dataPkt := &icmp.TunnelPacket{
 			Type:      icmp.TypeData,
+			Flags:     flags,
 			SessionID: session.ID,
 			SeqNum:    session.GetNextSeq(),
-			Data:      icmp.EncodeStreamData(req.StreamID, buf[:n]),
+			Data:      finalData,
 		}
-		s.log.Debug("Downlink: Sending data packet seq=%d (%d bytes)", dataPkt.SeqNum, n)
+		s.log.Debug("Downlink: Sending data packet seq=%d (raw=%d, encoded=%d bytes, compressed=%v)", 
+			dataPkt.SeqNum, n, len(finalData), (flags&icmp.FlagCompressed) != 0)
 		session.RecordSent(dataPkt)
 		s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, dataPkt)
 		
@@ -761,8 +795,15 @@ func (s *Server) handleDiag(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 
 func (s *Server) calculateMaxStreamData() int {
 	// Socket.Send check: 20 (IP) + 8 (ICMP) + len(payload) > s.maxPacketSize + 20
-	// So len(payload) max is s.maxPacketSize - 8.
-	room := s.cfg.ICMP.MaxPacketSize - 8
+	// Wait, the Socket.Send logic in socket.go is:
+	// packetSize := 20 + 8 + len(payload)
+	// if packetSize > s.maxPacketSize + 20 { ... }
+	// This means max IP packet length allowed is s.maxPacketSize + 20.
+	// That is confusing. If maxPacketSize is 1400, it allows 1420 bytes.
+	// To be safe and treat maxPacketSize as MTU, we want packetSize <= s.maxPacketSize.
+	// So 20 + 8 + len(payload) <= s.maxPacketSize
+	// len(payload) <= s.maxPacketSize - 28
+	room := s.cfg.ICMP.MaxPacketSize - 28
 
 	// Subtract Evasion overhead
 	room -= s.evasion.Overhead()

@@ -967,8 +967,9 @@ func getOutboundIP(target net.IP) net.IP {
 
 func (c *Client) calculateMaxStreamData() int {
 	// Socket.Send check: 20 (IP) + 8 (ICMP) + len(payload) > s.maxPacketSize + 20
-	// So len(payload) max is s.maxPacketSize - 8.
-	room := c.cfg.ICMP.MaxPacketSize - 8
+	// To treat maxPacketSize as MTU, we need 20 + 8 + len(payload) <= s.maxPacketSize
+	// len(payload) <= s.maxPacketSize - 28
+	room := c.cfg.ICMP.MaxPacketSize - 28
 
 	// Subtract Evasion overhead
 	room -= c.evasion.Overhead()
