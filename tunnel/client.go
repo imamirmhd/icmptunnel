@@ -311,7 +311,7 @@ func (c *Client) authenticate() error {
 func (c *Client) handleConnect(protocol, destination string) (uint16, chan []byte, error) {
 	streamID := icmp.GenerateStreamID()
 	c.log.Debug("Generated streamID %d for connection to %s", streamID, destination)
-	responseChan := make(chan []byte, 4096)
+	responseChan := make(chan []byte, 8192)
 	statusChan := make(chan error, 1)
 
 	c.streamsMu.Lock()
@@ -774,10 +774,10 @@ func (c *Client) receiveLoop() {
 				c.streamsMu.RLock()
 				for _, entry := range entries {
 					if ch, ok := c.streams[entry.StreamID]; ok {
-						// Use short timeout to avoid dropping data during transient congestion
+						// Use longer timeout to avoid dropping data during transient congestion
 						select {
 						case ch <- entry.Data:
-						case <-time.After(10 * time.Millisecond):
+						case <-time.After(100 * time.Millisecond):
 							c.log.Warn("Stream %d buffer full, dropping packet after timeout", entry.StreamID)
 						}
 					}
