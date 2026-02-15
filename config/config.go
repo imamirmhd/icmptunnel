@@ -23,6 +23,7 @@ type ServerConfig struct {
 // ClientConfig holds all client-side configuration.
 type ClientConfig struct {
 	ServerAddr string           `toml:"server_addr"`
+	BindAddr   string           `toml:"bind_addr"`
 	AuthToken  string           `toml:"auth_token"`
 	ICMP       ICMPConfig       `toml:"icmp"`
 	Encryption EncryptionConfig `toml:"encryption"`

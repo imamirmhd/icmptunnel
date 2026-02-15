@@ -91,10 +91,14 @@ func (d *Diagnostics) Ping(target string, count int) (*PingResult, error) {
 		deadline := time.Now().Add(5 * time.Second)
 		received := false
 		for time.Now().Before(deadline) {
-			srcIP, icmpType, _, _, recvPayload, err := d.socket.Receive()
+			srcIP, icmpType, _, _, recvPayload, origBuf, err := d.socket.Receive()
 			if err != nil {
+				if origBuf != nil {
+					icmp.ReleaseBuffer(origBuf)
+				}
 				continue
 			}
+			defer icmp.ReleaseBuffer(origBuf)
 			if icmpType == 0 && srcIP.Equal(targetIP) {
 				valid := false
 				if d.authToken != "" {
@@ -240,10 +244,14 @@ func (d *Diagnostics) PacketLoss(target string, count int) (*PacketLossResult, e
 		// Check for reply
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
-			srcIP, icmpType, _, _, _, err := d.socket.Receive()
+			srcIP, icmpType, _, _, _, origBuf, err := d.socket.Receive()
 			if err != nil {
+				if origBuf != nil {
+					icmp.ReleaseBuffer(origBuf)
+				}
 				continue
 			}
+			icmp.ReleaseBuffer(origBuf)
 			if icmpType == 0 && srcIP.Equal(targetIP) {
 				result.Received++
 				break
@@ -402,10 +410,14 @@ func (d *Diagnostics) StatusCheck(target string) error {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		srcIP, icmpType, _, _, recvPayload, err := d.socket.Receive()
+		srcIP, icmpType, _, _, recvPayload, origBuf, err := d.socket.Receive()
 		if err != nil {
+			if origBuf != nil {
+				icmp.ReleaseBuffer(origBuf)
+			}
 			continue
 		}
+		defer icmp.ReleaseBuffer(origBuf)
 		
 		if icmpType == 0 && srcIP.Equal(targetIP) {
 			// Check for Token match (Unified Ping)
@@ -437,10 +449,14 @@ func (d *Diagnostics) testPacket(src, dst net.IP, payload []byte) bool {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		srcIP, icmpType, _, _, _, err := d.socket.Receive()
+		srcIP, icmpType, _, _, _, origBuf, err := d.socket.Receive()
 		if err != nil {
+			if origBuf != nil {
+				icmp.ReleaseBuffer(origBuf)
+			}
 			continue
 		}
+		icmp.ReleaseBuffer(origBuf)
 		if icmpType == 0 && srcIP.Equal(dst) {
 			return true
 		}

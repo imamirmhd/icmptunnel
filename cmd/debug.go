@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/user/icmptunnel/config"
@@ -110,6 +111,26 @@ var statusCmd = &cobra.Command{
 	},
 }
 
+var stressCmd = &cobra.Command{
+	Use:   "stress [target]",
+	Short: "Run stress test against a target",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		level, _ := cmd.Flags().GetString("level")
+		duration, _ := cmd.Flags().GetDuration("duration")
+		
+		d, err := diag.New()
+		if err != nil {
+			return err
+		}
+		defer d.Close()
+		loadToken(d, cmd)
+		
+		_, err = d.StressTest(args[0], level, duration)
+		return err
+	},
+}
+
 func loadToken(d *diag.Diagnostics, cmd *cobra.Command) {
 	cfgPath, _ := cmd.Flags().GetString("config")
 	if cfgPath == "" {
@@ -129,12 +150,16 @@ func init() {
 	throughputCmd.Flags().IntP("duration", "d", 5, "test duration in seconds")
 	lossCmd.Flags().IntP("count", "c", 100, "number of packets")
 
+	stressCmd.Flags().StringP("level", "l", "low", "stress level (low, medium, high)")
+	stressCmd.Flags().DurationP("duration", "d", 10*time.Second, "test duration")
+
 	debugCmd.AddCommand(pingCmd)
 	debugCmd.AddCommand(throughputCmd)
 	debugCmd.AddCommand(lossCmd)
 	debugCmd.AddCommand(detectCmd)
 	debugCmd.AddCommand(spoofTestCmd)
 	debugCmd.AddCommand(statusCmd)
+	debugCmd.AddCommand(stressCmd)
 
 	rootCmd.AddCommand(debugCmd)
 

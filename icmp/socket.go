@@ -7,9 +7,22 @@ import (
 	"net"
 	"syscall"
 	"time"
+	"strings"
+	"sync"
 
 	"github.com/user/icmptunnel/logger"
 )
+
+var PacketPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 65535+28) // Max IPv4 packet + safety
+	},
+}
+
+// ReleaseBuffer returns a buffer to the pool.
+func ReleaseBuffer(b []byte) {
+	PacketPool.Put(b)
+}
 
 // Socket wraps a raw ICMP socket with send/receive capabilities.
 type Socket struct {
@@ -54,12 +67,23 @@ func NewSocket(maxPacketSize, ttl int, readTimeout, writeTimeout time.Duration) 
 	}, nil
 }
 
-// Bind binds the socket to INADDR_ANY for receiving all ICMP traffic.
-func (s *Socket) Bind() error {
+// Bind binds the socket to the specified address.
+// If address is empty or "0.0.0.0", it binds to all interfaces.
+func (s *Socket) Bind(address string) error {
 	addr := syscall.SockaddrInet4{Port: 0}
-	copy(addr.Addr[:], net.IPv4zero.To4())
+	
+	if address != "" && address != "0.0.0.0" {
+		ip := net.ParseIP(address)
+		if ip == nil {
+			return fmt.Errorf("invalid bind address: %s", address)
+		}
+		copy(addr.Addr[:], ip.To4())
+	} else {
+		copy(addr.Addr[:], net.IPv4zero.To4())
+	}
+
 	if err := syscall.Bind(s.fd, &addr); err != nil {
-		return fmt.Errorf("binding socket: %w", err)
+		return fmt.Errorf("binding socket to %s: %w", address, err)
 	}
 	return nil
 }
@@ -87,11 +111,11 @@ func (s *Socket) Send(srcIP, destIP net.IP, icmpType uint8, id, seq uint16, payl
 	binary.BigEndian.PutUint16(packet[6:8], 0)                 // Flags + Fragment offset
 	packet[8] = byte(s.ttl)                                    // TTL
 	packet[9] = syscall.IPPROTO_ICMP                           // Protocol
-	binary.BigEndian.PutUint16(packet[10:12], 0)               // Checksum placeholder
+	binary.BigEndian.PutUint16(packet[10:12], 0)               // Checksum (Reset for calculation)
 	copy(packet[12:16], src4)                                  // Source IP
 	copy(packet[16:20], dst4)                                  // Dest IP
 
-	// Calculate and fill IP checksum
+	// Calculate IP checksum (Manual calculation is often required for IP_HDRINCL on some platforms)
 	ipCksum := Checksum(packet[:20])
 	binary.BigEndian.PutUint16(packet[10:12], ipCksum)
 
@@ -106,7 +130,7 @@ func (s *Socket) Send(srcIP, destIP net.IP, icmpType uint8, id, seq uint16, payl
 	// Payload
 	copy(packet[28:], payload)
 
-	// Calculate ICMP checksum
+	// Calculate ICMP checksum (Required)
 	cksum := Checksum(packet[20:])
 	binary.BigEndian.PutUint16(packet[22:24], cksum)
 
@@ -139,33 +163,54 @@ func (s *Socket) SendReply(srcIP, destIP net.IP, id, seq uint16, payload []byte)
 
 // Receive reads one ICMP packet from the socket.
 // Returns the source IP, ICMP type, ID, Sequence, and payload.
-func (s *Socket) Receive() (srcIP net.IP, icmpType uint8, id, seq uint16, payload []byte, err error) {
-	buf := make([]byte, s.maxPacketSize+20+8)
+func (s *Socket) Receive() (srcIP net.IP, icmpType uint8, id, seq uint16, payload, originalBuf []byte, err error) {
+	buf := PacketPool.Get().([]byte)
+	// Caller is responsible for ReleaseBuffer(originalBuf)
 
 	// Set read deadline
 	tv := syscall.NsecToTimeval(s.readTimeout.Nanoseconds())
 	syscall.SetsockoptTimeval(s.fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
 
-	n, from, err := syscall.Recvfrom(s.fd, buf, 0)
+	var n int
+	var from syscall.Sockaddr
+	
+	for {
+		n, from, err = syscall.Recvfrom(s.fd, buf, 0)
+		if err != nil {
+			if err == syscall.EINTR || strings.Contains(err.Error(), "interrupted system call") {
+				continue
+			}
+		}
+		break
+	}
+
 	if err != nil {
-		return nil, 0, 0, 0, nil, fmt.Errorf("receiving: %w", err)
+		PacketPool.Put(buf)
+		// Don't wrap timeout error to allow caller to detect it easily if needed, 
+		// though currently caller checks string.
+		return nil, 0, 0, 0, nil, nil, fmt.Errorf("receiving: %w", err)
 	}
 
 	if n < 28 { // Min: 20 IP + 8 ICMP
-		return nil, 0, 0, 0, nil, fmt.Errorf("packet too small: %d bytes", n)
+		PacketPool.Put(buf)
+		return nil, 0, 0, 0, nil, nil, fmt.Errorf("packet too small: %d bytes", n)
 	}
 
 	// Extract source IP from sockaddr
 	if sa, ok := from.(*syscall.SockaddrInet4); ok {
 		srcIP = net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3])
 	} else {
-		return nil, 0, 0, 0, nil, fmt.Errorf("unexpected sockaddr type")
+		PacketPool.Put(buf)
+		return nil, 0, 0, 0, nil, nil, fmt.Errorf("unexpected sockaddr type")
 	}
+
+	s.log.Debug("Read %d bytes from %s", n, srcIP)
 
 	// Parse IP header to get IHL
 	ihl := int(buf[0]&0x0f) * 4
 	if n < ihl+8 {
-		return nil, 0, 0, 0, nil, fmt.Errorf("packet too small for headers")
+		PacketPool.Put(buf)
+		return nil, 0, 0, 0, nil, nil, fmt.Errorf("packet too small for headers")
 	}
 
 	// ICMP type
@@ -182,7 +227,7 @@ func (s *Socket) Receive() (srcIP net.IP, icmpType uint8, id, seq uint16, payloa
 		copy(payload, buf[payloadStart:n])
 	}
 
-	return srcIP, icmpType, id, seq, payload, nil
+	return srcIP, icmpType, id, seq, payload, buf, nil
 }
 
 // Close closes the raw socket.

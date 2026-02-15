@@ -36,6 +36,10 @@ type Session struct {
 	LastICMPSeq     uint16
 	OutboundICMPID  uint16
 	OutboundICMPSeq uint16
+	PushICMPID      uint16
+	LastSrcIP       net.IP
+	LastRouteFlag   uint8
+	LastRelayIP     net.IP
 	
 	// Sliding Window & Congestion Control
 	Mu            sync.RWMutex
@@ -55,6 +59,8 @@ type Session struct {
 	// Cleanup
 	Ctx    context.Context
 	Cancel context.CancelFunc
+
+	cond   *sync.Cond
 }
 
 type icmpSlot struct {
@@ -81,7 +87,14 @@ type Stream struct {
 	DataChan    chan []byte
 	Done        chan struct{}
 	CreatedAt   time.Time
+	State       uint8
 }
+
+const (
+	StreamStateOpen    uint8 = 0
+	StreamStateClosing uint8 = 1
+	StreamStateClosed  uint8 = 2
+)
 
 // SessionManager manages multiple tunnel sessions.
 type SessionManager struct {
@@ -90,15 +103,23 @@ type SessionManager struct {
 	mu             sync.RWMutex
 	log            *logger.Logger
 	timeout        time.Duration
+	defaultCWND    int
+	defaultSST     int
 }
 
 // NewSessionManager creates a new session manager.
 func NewSessionManager(timeout time.Duration) *SessionManager {
+	return NewSessionManagerWithParams(timeout, 512, 2048)
+}
+
+func NewSessionManagerWithParams(timeout time.Duration, cwnd, ssthresh int) *SessionManager {
 	sm := &SessionManager{
 		sessions:       make(map[uint32]*Session),
 		sessionsByAddr: make(map[string]*Session),
 		log:            logger.Default().WithComponent("session-mgr"),
 		timeout:        timeout,
+		defaultCWND:    cwnd,
+		defaultSST:     ssthresh,
 	}
 	go sm.cleanupLoop()
 	return sm
@@ -120,14 +141,17 @@ func (sm *SessionManager) CreateSessionWithID(clientAddr net.IP, id uint32) *Ses
 		recvBuf:       make(map[uint32]*TunnelPacket),
 		NextRecvSeq:   0,
 		inflight:      make(map[uint32]*inflightPacket),
-		cwnd:          512, // Large initial window for high concurrency
-		ssthresh:      2048,
+		cwnd:          sm.defaultCWND,
+		ssthresh:      sm.defaultSST,
 		rto:           time.Second,
 		receivedSeqs:  make(map[uint32]bool),
 		icmpSlots:     make(chan icmpSlot, 8192), // Buffer up to 8192 slots for high concurrency
-		OutboundICMPID: uint16(generateSessionID() & 0xFFFF),
+		OutboundICMPID:  uint16(generateSessionID() & 0xFFFF),
 		OutboundICMPSeq: 0,
+		PushICMPID:      uint16(generateSessionID() & 0xFFFF),
+		cond:            sync.NewCond(&sync.Mutex{}),
 	}
+	session.cond.L = &session.Mu
 
 	// Check for existing session with same IP
 	if old, ok := sm.sessionsByAddr[clientAddr.String()]; ok {
@@ -267,6 +291,10 @@ func (s *Session) ProcessACK(ackedSeq uint32, sackBlocks []uint32) []*TunnelPack
 		if s.cwnd > 4096 {
 			s.cwnd = 4096
 		}
+	}
+
+	if len(acknowledged) > 0 {
+		s.cond.Broadcast()
 	}
 
 	return acknowledged
@@ -421,6 +449,15 @@ func (s *Session) MarkReceived(seq uint32) {
 			}
 		}
 	}
+}
+
+// UpdateNATInfo records the network path to the client.
+func (s *Session) UpdateNATInfo(srcIP net.IP, routeFlag uint8, relayIP net.IP) {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	s.LastSrcIP = srcIP
+	s.LastRouteFlag = routeFlag
+	s.LastRelayIP = relayIP
 }
 
 // AddICMPSlot adds a new ICMP ID/Seq pair for use in responding.
@@ -599,8 +636,13 @@ func (s *Session) RemoveStream(id uint16) {
 // Iterate calls f for each active session.
 func (sm *SessionManager) Iterate(f func(*Session)) {
 	sm.mu.RLock()
-	defer sm.mu.RUnlock()
+	sessions := make([]*Session, 0, len(sm.sessions))
 	for _, s := range sm.sessions {
+		sessions = append(sessions, s)
+	}
+	sm.mu.RUnlock()
+
+	for _, s := range sessions {
 		f(s)
 	}
 }
@@ -771,4 +813,35 @@ func DecodeSACK(data []byte) (*SACK, error) {
 		s.Blocks = append(s.Blocks, binary.BigEndian.Uint32(data[i:i+4]))
 	}
 	return s, nil
+}
+
+// WaitSendCapacity blocks until the session has window availability to send.
+func (s *Session) WaitSendCapacity(ctx context.Context) error {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	for len(s.inflight) >= s.cwnd {
+		// Use a temporary channel to mix Sync.Cond with Context
+		ch := make(chan struct{})
+		go func() {
+			s.Mu.Lock()
+			s.cond.Wait()
+			s.Mu.Unlock()
+			close(ch)
+		}()
+
+		s.Mu.Unlock()
+		select {
+		case <-ctx.Done():
+			s.Mu.Lock()
+			return ctx.Err()
+		case <-s.Ctx.Done():
+			s.Mu.Lock()
+			return fmt.Errorf("session closed")
+		case <-ch:
+			// Condition broadcasted, reacquire lock and check loop
+			s.Mu.Lock()
+		}
+	}
+	return nil
 }

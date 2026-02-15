@@ -34,7 +34,7 @@ func NewServer(cfg *config.RelayServerConfig) (*Server, error) {
 		return nil, err
 	}
 
-	if err := sock.Bind(); err != nil {
+	if err := sock.Bind(cfg.Listen); err != nil {
 		sock.Close()
 		return nil, err
 	}
@@ -84,10 +84,14 @@ func (s *Server) receiveLoop() {
 		default:
 		}
 
-		srcIP, icmpType, id, seq, payload, err := s.socket.Receive()
+		srcIP, icmpType, id, seq, payload, origBuf, err := s.socket.Receive()
 		if err != nil {
+			if origBuf != nil {
+				icmp.ReleaseBuffer(origBuf)
+			}
 			continue
 		}
+		defer icmp.ReleaseBuffer(origBuf)
 
 		// Only process echo requests
 		if icmpType != 8 {
