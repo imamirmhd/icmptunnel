@@ -130,20 +130,36 @@ func (s *Socks5Server) handleConnection(conn net.Conn) {
 	var relayWg sync.WaitGroup
 	relayWg.Add(2)
 
+	var closeOnce sync.Once
+	closeConn := func() {
+		closeOnce.Do(func() {
+			conn.Close()
+		})
+	}
+	defer closeConn()
+
 	// Client -> Tunnel
 	go func() {
 		defer relayWg.Done()
+		defer closeConn()         // Close connection if read fails
+		defer s.onClose(streamID) // Ensure tunnel stream is closed
+		
 		bufSize := s.maxDataSize
 		if bufSize <= 0 {
 			bufSize = 32 * 1024
 		}
 		buf := make([]byte, bufSize)
-		s.log.Debug("Starting Client->Tunnel loop for stream %d", streamID)
+		// s.log.Debug("Starting Client->Tunnel loop for stream %d", streamID)
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
 				if err != io.EOF {
-					s.log.Debug("Read error from client: %v", err)
+					// Check if error is due to closed connection
+					if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+						// Ignore
+					} else {
+						s.log.Debug("Read error from client: %v", err)
+					}
 				}
 				return
 			}
@@ -158,6 +174,8 @@ func (s *Socks5Server) handleConnection(conn net.Conn) {
 	// Tunnel -> Client
 	go func() {
 		defer relayWg.Done()
+		defer closeConn() // Close connection if server closes stream or write fails
+		
 		for {
 			select {
 			case data, ok := <-responseChan:

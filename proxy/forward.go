@@ -136,9 +136,19 @@ func (f *Forwarder) handleTCPConn(conn net.Conn) {
 	var relayWg sync.WaitGroup
 	relayWg.Add(2)
 
+	var closeOnce sync.Once
+	closeConn := func() {
+		closeOnce.Do(func() {
+			conn.Close()
+		})
+	}
+
 	// Local -> Tunnel
 	go func() {
 		defer relayWg.Done()
+		defer closeConn() // Close connection if read fails
+		defer f.onClose(streamID) // Ensure tunnel stream is closed
+		
 		bufSize := f.maxDataSize
 		if bufSize <= 0 {
 			bufSize = 32 * 1024
@@ -158,6 +168,8 @@ func (f *Forwarder) handleTCPConn(conn net.Conn) {
 	// Tunnel -> Local
 	go func() {
 		defer relayWg.Done()
+		defer closeConn()
+		
 		for {
 			select {
 			case data, ok := <-responseChan:
