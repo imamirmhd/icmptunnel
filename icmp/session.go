@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 	"bytes"
-	"compress/flate"
+	"compress/zlib"
 	"io"
 	"sort"
 	"context"
@@ -49,9 +49,17 @@ type Session struct {
 	// SACK state
 	receivedSeqs  map[uint32]bool
 
+	// ICMP Slot tracking (for NAT compatibility)
+	icmpSlots chan icmpSlot
+
 	// Cleanup
 	Ctx    context.Context
 	Cancel context.CancelFunc
+}
+
+type icmpSlot struct {
+	ID  uint16
+	Seq uint16
 }
 
 type inflightPacket struct {
@@ -112,10 +120,11 @@ func (sm *SessionManager) CreateSessionWithID(clientAddr net.IP, id uint32) *Ses
 		recvBuf:       make(map[uint32]*TunnelPacket),
 		NextRecvSeq:   0,
 		inflight:      make(map[uint32]*inflightPacket),
-		cwnd:          10, // Initial window size
-		ssthresh:      64,
+		cwnd:          512, // Large initial window for high concurrency
+		ssthresh:      2048,
 		rto:           time.Second,
 		receivedSeqs:  make(map[uint32]bool),
+		icmpSlots:     make(chan icmpSlot, 8192), // Buffer up to 8192 slots for high concurrency
 		OutboundICMPID: uint16(generateSessionID() & 0xFFFF),
 		OutboundICMPSeq: 0,
 	}
@@ -197,10 +206,12 @@ func (s *Session) GetNextSeq() uint32 {
 func (s *Session) RecordSent(pkt *TunnelPacket) {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
+	now := time.Now()
 	s.inflight[pkt.SeqNum] = &inflightPacket{
 		Pkt:    pkt,
-		SentAt: time.Now(),
+		SentAt: now,
 	}
+	s.LastActivity = now // Keep session alive while sending
 }
 
 // ProcessACK handles an incoming ACK or SACK.
@@ -242,9 +253,19 @@ func (s *Session) ProcessACK(ackedSeq uint32, sackBlocks []uint32) []*TunnelPack
 	// Update congestion window
 	if len(acknowledged) > 0 {
 		if s.cwnd < s.ssthresh {
-			s.cwnd += len(acknowledged) // Slow start
+			s.cwnd += len(acknowledged) // Slow start: grow by ACKed count
 		} else {
-			s.cwnd += 1 // Congestion avoidance
+			// Congestion avoidance: more conservative growth
+			growth := len(acknowledged) / 8
+			if growth < 1 {
+				growth = 1
+			}
+			s.cwnd += growth
+		}
+		
+		// Cap cwnd to prevent buffer bloat/overflow (16MB buffer -> ~11000 pkts, so 4096 is safe ~5.7MB)
+		if s.cwnd > 4096 {
+			s.cwnd = 4096
 		}
 	}
 
@@ -267,6 +288,9 @@ func (s *Session) UpdateRTT(measured time.Duration) {
 	if s.rto < 50*time.Millisecond {
 		s.rto = 50 * time.Millisecond
 	}
+	if s.rto > 3*time.Second {
+		s.rto = 3 * time.Second
+	}
 }
 
 // GetRetransmissions returns packets that have timed out.
@@ -285,13 +309,18 @@ func (s *Session) GetRetransmissions() []*TunnelPacket {
 	}
 
 	if len(retrans) > 0 {
-		// Congestion: back off, but don't be too aggressive for ICMP
-		s.ssthresh = s.cwnd / 2
-		if s.ssthresh < 5 {
-			s.ssthresh = 5
+		// Mild congestion back-off for ICMP tunnel (localhost retransmissions
+		// are usually scheduling delays, not real congestion)
+		s.ssthresh = s.cwnd * 3 / 4
+		if s.ssthresh < 64 {
+			s.ssthresh = 64
 		}
-		// Instead of 1, drop to ssthresh or at least 5
-		s.cwnd = s.ssthresh
+		// Very mild reduction: 7/8 of current cwnd
+		newCwnd := s.cwnd * 7 / 8
+		if newCwnd < s.ssthresh {
+			newCwnd = s.ssthresh
+		}
+		s.cwnd = newCwnd
 	}
 
 	return retrans
@@ -357,19 +386,49 @@ func (s *Session) GenerateSACK() *SACK {
 	return sack
 }
 
-// MarkReceived records a sequence number as received.
+// MarkReceived records a sequence number as received and cleans up old state.
 func (s *Session) MarkReceived(seq uint32) {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 	s.receivedSeqs[seq] = true
-	
-	// Clean up old received seqs (keep ~2000 history)
-	if len(s.receivedSeqs) > 5000 {
-		for k := range s.receivedSeqs {
-			if s.isOlder(k, s.NextRecvSeq, 2000) {
-				delete(s.receivedSeqs, k)
+
+	// Cleanup: periodically remove very old sequence numbers to keep map size sane
+	if len(s.receivedSeqs) > 30000 {
+		for s_seq := range s.receivedSeqs {
+			if int32(s.NextRecvSeq-s_seq) > 20000 {
+				delete(s.receivedSeqs, s_seq)
 			}
 		}
+	}
+}
+
+// AddICMPSlot adds a new ICMP ID/Seq pair for use in responding.
+func (s *Session) AddICMPSlot(id, seq uint16) {
+	slot := icmpSlot{ID: id, Seq: seq}
+	select {
+	case s.icmpSlots <- slot:
+	default:
+		// Channel full? Drain one and add new (keep most recent)
+		select {
+		case <-s.icmpSlots:
+		default:
+		}
+		select {
+		case s.icmpSlots <- slot:
+		default:
+		}
+	}
+}
+
+// GetICMPSlot returns a fresh ICMP ID/Seq pair, blocking if none available.
+func (s *Session) GetICMPSlot(ctx context.Context) (uint16, uint16, error) {
+	select {
+	case slot := <-s.icmpSlots:
+		return slot.ID, slot.Seq, nil
+	case <-ctx.Done():
+		return 0, 0, ctx.Err()
+	case <-s.Ctx.Done():
+		return 0, 0, fmt.Errorf("session closed")
 	}
 }
 
@@ -419,6 +478,8 @@ func (s *Session) ProcessIncoming(pkt *TunnelPacket) []*TunnelPacket {
 	// If this is exactly what we expect
 	if pkt.SeqNum == s.NextRecvSeq {
 		s.NextRecvSeq++
+		// Packets < NextRecvSeq are implicitly acked, so remove from map to keep it small
+		delete(s.receivedSeqs, pkt.SeqNum)
 		result := []*TunnelPacket{pkt}
 
 		// Check buffer for subsequent packets
@@ -428,6 +489,9 @@ func (s *Session) ProcessIncoming(pkt *TunnelPacket) []*TunnelPacket {
 				nextPkt.ICMPID = pkt.ICMPID
 				nextPkt.ICMPSeq = pkt.ICMPSeq
 				result = append(result, nextPkt)
+				
+				// Clean up maps
+				delete(s.receivedSeqs, s.NextRecvSeq)
 				delete(s.recvBuf, s.NextRecvSeq)
 				s.NextRecvSeq++
 			} else {
@@ -446,18 +510,21 @@ func (s *Session) ProcessIncoming(pkt *TunnelPacket) []*TunnelPacket {
 	return nil
 }
 
-// Compress applies flate compression to data.
+// Compress applies zlib compression to data.
 func (s *Session) Compress(data []byte) []byte {
 	var b bytes.Buffer
-	w, _ := flate.NewWriter(&b, flate.BestSpeed)
+	w := zlib.NewWriter(&b)
 	w.Write(data)
 	w.Close()
 	return b.Bytes()
 }
 
-// Decompress removes flate compression from data.
+// Decompress removes zlib compression from data.
 func (s *Session) Decompress(data []byte) ([]byte, error) {
-	r := flate.NewReader(bytes.NewReader(data))
+	r, err := zlib.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
 	defer r.Close()
 	return io.ReadAll(r)
 }

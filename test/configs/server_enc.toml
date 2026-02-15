@@ -1,0 +1,24 @@
+# Encrypted Server
+listen = "0.0.0.0"
+auth_tokens = ["4c48c17d4707bdc26c2296c7c8af43dea2321c0c2e91c5ae7c677991cdd3ba2b"]
+
+[icmp]
+max_packet_size = 1300
+read_timeout = "5s"
+write_timeout = "5s"
+
+[encryption]
+enabled = true
+key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+method = "aes-256-gcm"
+
+[firewall]
+disable_echo_reply = true
+enable_forwarding = true
+
+[transport]
+window_size = 100
+
+[logging]
+level = "info"
+output = "test_run_enc_server.log"

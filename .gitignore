@@ -1,7 +1,7 @@
 icmptunnel
 *.log
 *.exe
-# bin/ removed to allow tracking binaries for release
+bin/
 # test/ removed to allow tracking test suite
 test/local_*.toml
 .agent/

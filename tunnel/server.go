@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,7 +16,6 @@ import (
 	"github.com/user/icmptunnel/evasion"
 	"github.com/user/icmptunnel/icmp"
 	"github.com/user/icmptunnel/logger"
-	"strings"
 )
 
 // Server manages the server side of the ICMP tunnel.
@@ -277,24 +277,35 @@ func (s *Server) receiveLoop() {
 		tunnelPkt.ICMPID = icmpID
 		tunnelPkt.ICMPSeq = icmpSeq
 
-		// Decompression
-		if (tunnelPkt.Flags & icmp.FlagCompressed) != 0 {
-			session := s.sessionMgr.GetSession(tunnelPkt.SessionID)
-			if session != nil {
+		session := s.sessionMgr.GetSession(tunnelPkt.SessionID)
+		if session != nil {
+			// Ignore reflected packets we sent ourselves
+			if icmpID == session.OutboundICMPID && (icmpType == 0 || icmpType == 8) {
+				continue
+			}
+
+			// Decompression
+			if (tunnelPkt.Flags & icmp.FlagCompressed) != 0 {
 				decomp, err := session.Decompress(tunnelPkt.Data)
 				if err == nil {
 					tunnelPkt.Data = decomp
+					tunnelPkt.Flags &= ^icmp.FlagCompressed // Clear flag after success
+				} else {
+					s.log.Error("Decompress failed for session %08x seq %d: %v", session.ID, tunnelPkt.SeqNum, err)
+					continue // Drop corrupted packet
 				}
 			}
 		}
 
+		s.log.Debug("Received tunnel pkt: session=%08x, seq=%d, icmp_id=%d, icmp_seq=%d", 
+			tunnelPkt.SessionID, tunnelPkt.SeqNum, icmpID, icmpSeq)
 		s.handlePacket(realClientIP, srcIP, routeFlag, relayIP, tunnelPkt)
 	}
 }
 
 func (s *Server) retransmitLoop() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(200 * time.Millisecond) // Retransmission check
+	ticker := time.NewTicker(100 * time.Millisecond) // Retransmission check
 	sackTicker := time.NewTicker(1 * time.Second)    // SACK generation
 	defer ticker.Stop()
 	defer sackTicker.Stop()
@@ -308,14 +319,14 @@ func (s *Server) retransmitLoop() {
 				retrans := session.GetRetransmissions()
 				for _, p := range retrans {
 					s.log.Debug("Retransmitting packet %d to %s", p.SeqNum, session.ClientAddr)
-					s.sendResponse(session.ClientAddr, session.ClientAddr, icmp.RouteDirect, nil, session.LastICMPID, session.LastICMPSeq, p)
+					s.sendPush(session.ClientAddr, session.ClientAddr, icmp.RouteDirect, nil, session, p)
 				}
 			})
 		case <-sackTicker.C:
 			s.sessionMgr.Iterate(func(session *icmp.Session) {
 				if session.Authenticated {
 					sackPkt := session.GenerateSACK().EncodePacket(session.ID)
-					s.sendResponse(session.ClientAddr, session.ClientAddr, icmp.RouteDirect, nil, session.LastICMPID, session.LastICMPSeq, sackPkt)
+					s.sendPush(session.ClientAddr, session.ClientAddr, icmp.RouteDirect, nil, session, sackPkt)
 				}
 			})
 		}
@@ -327,6 +338,23 @@ func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 	switch pkt.Type {
 	case icmp.TypeAuth, icmp.TypeDiag, icmp.TypeData, icmp.TypeControl:
 		session := s.sessionMgr.GetSession(pkt.SessionID)
+		if session != nil {
+			// Only add to slot pool if this packet doesn't expect a direct response.
+			// Packets that expect a direct response (Connect, Auth, Close) should
+			// use their own original ICMP ID/Seq for that response.
+			shouldAddSlot := false
+			if pkt.Type == icmp.TypeData || pkt.Type == icmp.TypeDiag {
+				shouldAddSlot = true
+			} else if pkt.Type == icmp.TypeControl {
+				subtype, _, _ := icmp.DecodeControlMessage(pkt.Data)
+				if subtype == icmp.ControlACK || subtype == icmp.ControlSACK || subtype == icmp.ControlHeartbeat {
+					shouldAddSlot = true
+				}
+			}
+			if shouldAddSlot {
+				session.AddICMPSlot(pkt.ICMPID, pkt.ICMPSeq)
+			}
+		}
 		if pkt.Type != icmp.TypeAuth && (session == nil || !session.Authenticated) {
 			s.log.Debug("Packet from unauthenticated session %08x", pkt.SessionID)
 			
@@ -345,6 +373,20 @@ func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 			return
 		}
 
+		// Fast-track critical control messages to avoid Head-of-Line blocking
+		fastTracked := false
+		if pkt.Type == icmp.TypeControl && session != nil {
+			subtype, _, _ := icmp.DecodeControlMessage(pkt.Data)
+			// SACKs, Heartbeats, and Connect requests should be processed ASAP
+			if subtype == icmp.ControlSACK || subtype == icmp.ControlHeartbeat || subtype == icmp.ControlConnect || subtype == icmp.ControlClose {
+				s.handleControl(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, session, pkt)
+				fastTracked = true
+				if pkt.SeqNum == 0 {
+					return // Unsequenced control, we are done
+				}
+			}
+		}
+
 		// Reliability layer: sequencing and reordering
 		var pkts []*icmp.TunnelPacket
 		if session != nil {
@@ -353,8 +395,10 @@ func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 				s.log.Debug("Received duplicate packet %d (type %d)", pkt.SeqNum, pkt.Type)
 				
 				if pkt.Type == icmp.TypeControl {
-					s.log.Debug("Re-acknowledging duplicate control packet %d", pkt.SeqNum)
-					s.handleControl(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, session, pkt)
+					if !fastTracked {
+						s.log.Debug("Re-acknowledging duplicate control packet %d", pkt.SeqNum)
+						s.handleControl(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, session, pkt)
+					}
 					return
 				} else if pkt.Type == icmp.TypeData {
 					// Duplicate Data packet: Re-send ACK so client stops retransmitting
@@ -374,6 +418,9 @@ func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 		}
 
 		for _, p := range pkts {
+			if p.Type == icmp.TypeControl && fastTracked && p.SeqNum == pkt.SeqNum {
+				continue // Already handled via fast-track
+			}
 			switch p.Type {
 			case icmp.TypeAuth:
 				s.handleAuth(clientIP, srcIP, routeFlag, relayIP, p.ICMPID, p.ICMPSeq, p)
@@ -493,8 +540,35 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 	streamID := uint16(value)
 	s.log.Debug("Received Control packet: subtype=%d, value=%d from %s", subtype, value, clientIP)
 
+	// Send ACK early for control messages that don't already send their own response.
+	// This stops client retries immediately.
+	shouldGenericAck := false
+	switch subtype {
+	case icmp.ControlACK, icmp.ControlSACK, icmp.ControlHeartbeat:
+		// These already have their own response or don't need ACK
+	default:
+		shouldGenericAck = true
+	}
+
+	if shouldGenericAck && session != nil {
+		ackPkt := &icmp.TunnelPacket{
+			Type:      icmp.TypeControl,
+			SessionID: session.ID,
+			SeqNum:    0, // Generic ACKs are unsequenced
+			Data:      icmp.EncodeControlMessage(icmp.ControlACK, pkt.SeqNum),
+		}
+		s.sendResponse(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, ackPkt)
+	}
+
 	switch subtype {
 	case icmp.ControlConnect:
+		req, err := icmp.DecodeConnectRequest(pkt.Data)
+		if err != nil {
+			s.log.Error("Decode connect request: %v", err)
+			return
+		}
+
+		streamID := req.StreamID
 		connKey := fmt.Sprintf("%s:%d", clientIP, streamID)
 		
 		s.connMu.RLock()
@@ -521,7 +595,7 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 		}
 		if s.connecting[connKey] {
 			s.connMu.Unlock()
-			s.log.Debug("Connection for stream %s is already in progress, skipping", connKey)
+			s.log.Debug("Connection for stream %s is already in progress, ignoring retry", connKey)
 			return
 		}
 		s.connecting[connKey] = true
@@ -534,12 +608,6 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 				delete(s.connecting, connKey)
 				s.connMu.Unlock()
 			}()
-
-			req, err := icmp.DecodeConnectRequest(pkt.Data)
-			if err != nil {
-				s.log.Error("Decode connect request: %v", err)
-				return
-			}
 
 			s.log.Info("Connect request: stream=%d proto=%s dest=%s from %s",
 				req.StreamID, req.Protocol, req.Destination, clientIP)
@@ -634,22 +702,6 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 	case icmp.ControlHeartbeat:
 		// Heartbeat just touches session activity
 	}
-
-	// Send ACK for control messages that don't already send their own response.
-	switch subtype {
-	case icmp.ControlACK, icmp.ControlSACK, icmp.ControlHeartbeat:
-		// These already have their own response or don't need ACK
-	default:
-		if session != nil {
-			ackPkt := &icmp.TunnelPacket{
-				Type:      icmp.TypeControl,
-				SessionID: session.ID,
-				SeqNum:    session.GetNextSeq(),
-				Data:      icmp.EncodeControlMessage(icmp.ControlACK, pkt.SeqNum),
-			}
-			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, ackPkt)
-		}
-	}
 }
 
 func (s *Server) runUplink(session *icmp.Session, stream *icmp.Stream, conn net.Conn, connKey string, req *icmp.ConnectRequest) {
@@ -704,26 +756,13 @@ func (s *Server) runDownlink(session *icmp.Session, stream *icmp.Stream, conn ne
 		default:
 		}
 
-		// Backpressure: wait if the congestion window is full
-		for {
-			if session.GetInflightCount() < session.GetCWND() {
-				break
-			}
-			select {
-			case <-s.done:
-				return
-			case <-stream.Done:
-				return
-			case <-session.Ctx.Done():
-				return
-			case <-time.After(10 * time.Millisecond):
-				// check again
-			}
-		}
-
-		conn.SetReadDeadline(time.Now().Add(time.Second))
+		// READ DATA FIRST, then send it proactively.
+		conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 		n, err := conn.Read(buf)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
 			if err == io.EOF {
 				s.log.Debug("Downlink: EOF from %s for stream %d", req.Destination, req.StreamID)
 				closePkt := &icmp.TunnelPacket{
@@ -733,11 +772,8 @@ func (s *Server) runDownlink(session *icmp.Session, stream *icmp.Stream, conn ne
 					Data:      icmp.EncodeControlMessage(icmp.ControlClose, uint32(req.StreamID)),
 				}
 				session.RecordSent(closePkt)
-				s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, closePkt)
+				s.sendPush(clientIP, srcIP, routeFlag, relayIP, session, closePkt)
 				return
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
 			}
 			s.log.Error("Downlink: Read error from %s for stream %d: %v", req.Destination, req.StreamID, err)
 			closePkt := &icmp.TunnelPacket{
@@ -747,12 +783,20 @@ func (s *Server) runDownlink(session *icmp.Session, stream *icmp.Stream, conn ne
 				Data:      icmp.EncodeControlMessage(icmp.ControlClose, uint32(req.StreamID)),
 			}
 			session.RecordSent(closePkt)
-			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, closePkt)
+			s.sendPush(clientIP, srcIP, routeFlag, relayIP, session, closePkt)
 			return
 		}
 
 		s.log.Debug("Downlink: Read %d bytes from %s for stream %d", n, req.Destination, req.StreamID)
-		
+
+		// Soft backpressure: only micro-delay when heavily loaded, never hard-block
+		inflightCount := session.GetInflightCount()
+		cwnd := session.GetCWND()
+		if inflightCount > cwnd*4/5 {
+			// Over 80% of cwnd used — brief yield to let ACKs clear
+			time.Sleep(time.Microsecond * 100)
+		}
+
 		finalData := icmp.EncodeStreamData(req.StreamID, buf[:n])
 		var flags uint8
 		if s.cfg.Transport.Compression {
@@ -770,13 +814,10 @@ func (s *Server) runDownlink(session *icmp.Session, stream *icmp.Stream, conn ne
 			SeqNum:    session.GetNextSeq(),
 			Data:      finalData,
 		}
-		s.log.Debug("Downlink: Sending data packet seq=%d (raw=%d, encoded=%d bytes, compressed=%v)", 
+		s.log.Debug("Downlink: Pushing data packet seq=%d (raw=%d, encoded=%d bytes, compressed=%v)", 
 			dataPkt.SeqNum, n, len(finalData), (flags&icmp.FlagCompressed) != 0)
 		session.RecordSent(dataPkt)
-		s.sendResponse(clientIP, srcIP, routeFlag, relayIP, session.LastICMPID, session.LastICMPSeq, dataPkt)
-		
-		// Micro-delay to prevent flooding
-		time.Sleep(100 * time.Microsecond)
+		s.sendPush(clientIP, srcIP, routeFlag, relayIP, session, dataPkt)
 	}
 }
 
@@ -857,6 +898,49 @@ func (s *Server) sendResponse(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 
 		if err := s.socket.SendReply(localIP, destIP, icmpID, icmpSeq, p); err != nil {
 			return fmt.Errorf("socket send: %w", err)
+		}
+	}
+	return nil
+}
+
+// sendPush proactively pushes data to the client using ICMP Echo Requests.
+// This avoids the slot bottleneck for high-concurrency downlink.
+func (s *Server) sendPush(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, session *icmp.Session, pkt *icmp.TunnelPacket) error {
+	payload := pkt.Encode()
+
+	encrypted, err := s.encryptor.Encrypt(payload)
+	if err != nil {
+		return fmt.Errorf("encrypt: %w", err)
+	}
+
+	packets, err := s.evasion.Apply(encrypted)
+	if err != nil {
+		return fmt.Errorf("evasion: %w", err)
+	}
+
+	for _, p := range packets {
+		delay := s.evasion.PreSendDelay()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+
+		var destIP net.IP
+		if routeFlag == icmp.RouteViaRelay && relayIP != nil {
+			destIP = relayIP
+		} else {
+			destIP = clientIP
+		}
+
+		localIP := s.getLocalIP(destIP)
+		if localIP == nil || localIP.IsUnspecified() {
+			return fmt.Errorf("could not find local IP")
+		}
+
+		// Use session's outbound ICMP ID + incrementing sequence
+		icmpID := session.OutboundICMPID
+		icmpSeq := session.GetNextICMPSeq()
+		if err := s.socket.SendEcho(localIP, destIP, icmpID, icmpSeq, p); err != nil {
+			return fmt.Errorf("socket push: %w", err)
 		}
 	}
 	return nil

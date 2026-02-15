@@ -35,12 +35,12 @@ func NewSocket(maxPacketSize, ttl int, readTimeout, writeTimeout time.Duration) 
 	}
 
 	// Set receive buffer size.
-	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024); err != nil {
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024*1024); err != nil {
 		// Non-fatal, just log.
 	}
 
 	// Set send buffer size.
-	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024); err != nil {
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 16*1024*1024); err != nil {
 		// Non-fatal.
 	}
 

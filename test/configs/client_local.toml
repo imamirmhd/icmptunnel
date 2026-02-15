@@ -1,0 +1,15 @@
+server_addr = "127.0.0.1"
+auth_token = "7fbda71b3787265029d351c4a35783aac1f19229c2b409844758f7a57999ef81"
+
+[[socks5]]
+listen = "127.0.0.1:1000"
+
+[icmp]
+max_packet_size = 1400
+
+[encryption]
+enabled = false
+
+[transport]
+window_size = 100
+compression = true

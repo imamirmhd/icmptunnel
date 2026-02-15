@@ -50,6 +50,7 @@ type Client struct {
 	aggData   []byte
 	aggTimer  *time.Timer
 	maxAgg    int
+	pollTicks int
 }
 
 // NewClient creates a new tunnel client.
@@ -242,7 +243,11 @@ func (c *Client) authenticate() error {
 			continue
 		}
 
-		if icmpType != 0 && (icmpType != 8 || (srcIP.Equal(c.localAddr) && !c.cfg.Spoof.Enabled)) {
+		if icmpType != 0 && icmpType != 8 {
+			continue
+		}
+		// Ignore own outbound echo requests
+		if icmpType == 8 && c.session != nil && icmpID == c.session.OutboundICMPID {
 			continue
 		}
 
@@ -296,6 +301,16 @@ func (c *Client) authenticate() error {
 					c.session.Authenticated = true
 					c.session.MarkReceived(tunnelPkt.SeqNum) // Advance sequence
 					c.session.ProcessIncoming(tunnelPkt)   // Captures NAT info
+					
+					// Send ACK for AuthOK so server stops retransmitting
+					ackPkt := &icmp.TunnelPacket{
+						Type:      icmp.TypeControl,
+						SessionID: c.session.ID,
+						SeqNum:    c.session.GetNextSeq(),
+						Data:      icmp.EncodeControlMessage(icmp.ControlACK, tunnelPkt.SeqNum),
+					}
+					c.sendTunnelPacket(ackPkt)
+					
 					return nil
 				}
 				if len(tunnelPkt.Data) > 0 && tunnelPkt.Data[0] == icmp.ControlAuthFail {
@@ -337,7 +352,7 @@ func (c *Client) handleConnect(protocol, destination string) (uint16, chan []byt
 		Data:      controlData,
 	}
 	// Send connect request to server reliably
-	if err := c.sendPacketReliable(pkt, 2*time.Second, 5); err != nil {
+	if err := c.sendPacketReliable(pkt, 5*time.Second, 15); err != nil {
 		c.handleClose(streamID)
 		return 0, nil, err
 	}
@@ -351,7 +366,7 @@ func (c *Client) handleConnect(protocol, destination string) (uint16, chan []byt
 		}
 		c.log.Info("Stream %d established to %s", streamID, destination)
 		return streamID, responseChan, nil
-	case <-time.After(30 * time.Second):
+	case <-time.After(120 * time.Second):
 		c.handleClose(streamID)
 		return 0, nil, fmt.Errorf("connect timeout waiting for status")
 	}
@@ -654,10 +669,15 @@ func (c *Client) receiveLoop() {
 			continue
 		}
 
-		// Client only cares about Echo Reply (0) or Echo Request (8) if relayed
-		// For NAT traversal, we might receive Echo Request (8) from the server
-		// if it's echoing our packets back.
-		if icmpType != 0 && (icmpType != 8 || (srcIP.Equal(c.localAddr) && !c.cfg.Spoof.Enabled)) {
+		// Client accepts Echo Reply (0) and Echo Request (8).
+		// Echo Requests from the server are "push" packets for high-throughput downlink.
+		// Only filter out our own outbound Echo Requests (reflected back by the socket).
+		if icmpType != 0 && icmpType != 8 {
+			continue
+		}
+
+		// Ignore reflected packets we sent ourselves (same outbound ICMP ID)
+		if icmpType == 8 && icmpID == c.session.OutboundICMPID {
 			continue
 		}
 
@@ -705,6 +725,18 @@ func (c *Client) receiveLoop() {
 			continue
 		}
 
+		// Early decompression
+		if (tunnelPkt.Flags & icmp.FlagCompressed) != 0 {
+			decomp, err := c.session.Decompress(tunnelPkt.Data)
+			if err == nil {
+				tunnelPkt.Data = decomp
+				tunnelPkt.Flags &= ^icmp.FlagCompressed // Clear flag after success
+			} else {
+				c.log.Error("Decompress failed for session %08x seq %d: %v", c.session.ID, tunnelPkt.SeqNum, err)
+				continue // Drop corrupted packet
+			}
+		}
+
 		c.log.Debug("Received tunnel pkt: Type=%d, Seq=%d, Len=%d", tunnelPkt.Type, tunnelPkt.SeqNum, len(tunnelPkt.Data))
 		if tunnelPkt.Type == icmp.TypeControl {
 			subtype, streamID, _ := icmp.DecodeControlMessage(tunnelPkt.Data)
@@ -722,12 +754,22 @@ func (c *Client) receiveLoop() {
 		}
 
 		// Check for ControlAuthFail immediately (bypassing sequence check)
+		// Fast-track critical control messages (ACK, SACK, ConnectACK, AuthOK)
+		fastTracked := false
 		if tunnelPkt.Type == icmp.TypeControl {
-			subtype, _, _ := icmp.DecodeControlMessage(tunnelPkt.Data)
+			subtype, value, _ := icmp.DecodeControlMessage(tunnelPkt.Data)
 			if subtype == icmp.ControlAuthFail {
 				c.log.Warn("Authentication failed or session expired")
 				c.triggerReconnect()
 				continue
+			}
+			// SACK, ACK and ConnectACK/Fail should be handled immediately to avoid HOL blocking
+			if subtype == icmp.ControlACK || subtype == icmp.ControlSACK || subtype == icmp.ControlConnectACK || subtype == icmp.ControlConnectFail || subtype == icmp.ControlAuthOK {
+				c.handleControl(subtype, value, tunnelPkt.Data)
+				fastTracked = true
+				if tunnelPkt.SeqNum == 0 {
+					continue // Unsequenced control (heartbeats/polls)
+				}
 			}
 		}
 
@@ -736,13 +778,15 @@ func (c *Client) receiveLoop() {
 		diff := int32(tunnelPkt.SeqNum - c.session.NextRecvSeq)
 		if diff < 0 {
 			// Duplicate, re-ack
-			ackPkt := &icmp.TunnelPacket{
-				Type:      icmp.TypeControl,
-				SessionID: c.session.ID,
-				SeqNum:    c.session.GetNextSeq(),
-				Data:      icmp.EncodeControlMessage(icmp.ControlACK, tunnelPkt.SeqNum),
+			if !fastTracked {
+				ackPkt := &icmp.TunnelPacket{
+					Type:      icmp.TypeControl,
+					SessionID: c.session.ID,
+					SeqNum:    0, // Re-acks don't need to be sequenced
+					Data:      icmp.EncodeControlMessage(icmp.ControlACK, tunnelPkt.SeqNum),
+				}
+				c.sendTunnelPacket(ackPkt)
 			}
-			c.sendTunnelPacket(ackPkt)
 			continue
 		}
 		if diff >= 10000 { // Too far ahead
@@ -753,15 +797,17 @@ func (c *Client) receiveLoop() {
 		pkts := c.session.ProcessIncoming(tunnelPkt)
 		if pkts == nil && c.session.IsDuplicate(tunnelPkt.SeqNum) && tunnelPkt.Type == icmp.TypeControl {
 			// Re-acknowledge duplicate control packet to stop server retransmitting
-			subtype, _, _ := icmp.DecodeControlMessage(tunnelPkt.Data)
-			if subtype != icmp.ControlACK && subtype != icmp.ControlSACK {
-				ackPkt := &icmp.TunnelPacket{
-					Type:      icmp.TypeControl,
-					SessionID: c.session.ID,
-					SeqNum:    c.session.GetNextSeq(),
-					Data:      icmp.EncodeControlMessage(icmp.ControlACK, tunnelPkt.SeqNum),
+			if !fastTracked {
+				subtype, _, _ := icmp.DecodeControlMessage(tunnelPkt.Data)
+				if subtype != icmp.ControlACK && subtype != icmp.ControlSACK {
+					ackPkt := &icmp.TunnelPacket{
+						Type:      icmp.TypeControl,
+						SessionID: c.session.ID,
+						SeqNum:    0, // Re-acknowledgments don't need to be sequenced
+						Data:      icmp.EncodeControlMessage(icmp.ControlACK, tunnelPkt.SeqNum),
+					}
+					c.sendTunnelPacket(ackPkt)
 				}
-				c.sendTunnelPacket(ackPkt)
 			}
 		}
 		for _, p := range pkts {
@@ -796,7 +842,7 @@ func (c *Client) receiveLoop() {
 					ackPkt := &icmp.TunnelPacket{
 						Type:      icmp.TypeControl,
 						SessionID: c.session.ID,
-						SeqNum:    c.session.GetNextSeq(),
+						SeqNum:    0, // Non-data ACKs don't need to be sequenced
 						Data:      icmp.EncodeControlMessage(icmp.ControlACK, p.SeqNum),
 					}
 					c.sendTunnelPacket(ackPkt)
@@ -809,9 +855,9 @@ func (c *Client) receiveLoop() {
 func (c *Client) heartbeatLoop() {
 	defer c.wg.Done()
 	heartbeatTicker := time.NewTicker(10 * time.Second)
-	sackTicker := time.NewTicker(5 * time.Millisecond)
+	pollTicker := time.NewTicker(2 * time.Millisecond)
 	defer heartbeatTicker.Stop()
-	defer sackTicker.Stop()
+	defer pollTicker.Stop()
 
 	// Start receiveLoop once
 	c.wg.Add(1)
@@ -833,7 +879,7 @@ func (c *Client) heartbeatLoop() {
 			pkt := &icmp.TunnelPacket{
 				Type:      icmp.TypeControl,
 				SessionID: c.session.ID,
-				SeqNum:    c.session.GetNextSeq(),
+				SeqNum:    0, // Heartbeats don't need to be in the reliable sequence
 				Data:      append([]byte{icmp.ControlHeartbeat}, ts...),
 			}
 			if err := c.sendTunnelPacket(pkt); err != nil {
@@ -845,9 +891,9 @@ func (c *Client) heartbeatLoop() {
 				c.log.Warn("Tunnel timeout, attempting to reconnect...")
 				c.triggerReconnect()
 			}
-		case <-sackTicker.C:
+		case <-pollTicker.C:
 			// Send SACK or simple heartbeat pull more frequently when active
-			if c.session == nil {
+			if c.session == nil || !c.session.Authenticated {
 				continue
 			}
 
@@ -855,21 +901,42 @@ func (c *Client) heartbeatLoop() {
 			activeStreams := len(c.streams)
 			c.streamsMu.RUnlock()
 
-			// If active, run faster (handled by ticker adjustment or just check)
-			// For now, let's keep 200ms but maybe we should make it faster.
-			// Actually, let's make it 50ms if active.
-			
-			sack := c.session.GenerateSACK()
-			// Always send SACK if we have active streams to "pull" data from server
-			if len(sack.Blocks) > 0 || sack.AckedSeq != c.session.NextSeqRecv - 1 || activeStreams > 0 {
+			// Baseline polling every 200ms when idle
+			// Since pollTicker is 2ms, 200ms is 100 ticks.
+			c.pollTicks++
+			if activeStreams == 0 && c.pollTicks < 100 {
+				continue
+			}
+			c.pollTicks = 0
+
+			// Scale burst size proportionally with active streams.
+			// Each active stream needs ~1 slot per read cycle to keep data flowing.
+			// 2ms * 500 ticks/sec * burst = slots/sec available for downlink.
+			// For 50 streams: burst ~50 → 25000 slots/sec → ~34 MB/s max
+			burstSize := 5
+			if activeStreams == 0 {
+				burstSize = 1
+			} else if activeStreams >= 40 {
+				burstSize = activeStreams + 20
+			} else if activeStreams >= 20 {
+				burstSize = activeStreams + 10
+			} else if activeStreams >= 5 {
+				burstSize = activeStreams + 5
+			} else {
+				burstSize = 10
+			}
+
+			for i := 0; i < burstSize; i++ {
+				sack := c.session.GenerateSACK()
 				sackPkt := &icmp.TunnelPacket{
 					Type:      icmp.TypeControl,
 					SessionID: c.session.ID,
-					SeqNum:    c.session.GetNextSeq(),
+					SeqNum:    0, // SACK polls don't need to be reliable/sequenced
 					Data:      icmp.EncodeSACK(sack),
 				}
 				if err := c.sendTunnelPacket(sackPkt); err != nil {
 					c.log.Debug("SACK pull failed: %v", err)
+					break
 				}
 			}
 		}
