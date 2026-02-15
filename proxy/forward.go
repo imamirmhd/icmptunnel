@@ -137,8 +137,10 @@ func (f *Forwarder) handleTCPConn(conn net.Conn) {
 	relayWg.Add(2)
 
 	var closeOnce sync.Once
+	closeNotifier := make(chan struct{})
 	closeConn := func() {
 		closeOnce.Do(func() {
+			close(closeNotifier)
 			conn.Close()
 		})
 	}
@@ -179,6 +181,8 @@ func (f *Forwarder) handleTCPConn(conn net.Conn) {
 				if _, err := conn.Write(data); err != nil {
 					return
 				}
+			case <-closeNotifier:
+				return
 			case <-f.done:
 				return
 			}

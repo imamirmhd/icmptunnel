@@ -11,5 +11,5 @@ max_packet_size = 1400
 enabled = false
 
 [transport]
-window_size = 100
+window_size = 8192
 compression = true

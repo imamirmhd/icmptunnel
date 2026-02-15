@@ -113,11 +113,12 @@ const TunnelHeaderSize = 11 // 1 flags + 4 session_id + 4 seq_num + 2 data_len
 //	bit 5: SPOOF flag
 //	bits 6-7: reserved
 type TunnelPacket struct {
-	Type      uint8  // Packet type (TypeData, TypeAuth, etc.)
-	Flags     uint8  // Additional flags
-	SessionID uint32 // Session identifier
-	SeqNum    uint32 // Sequence number
-	Data      []byte // Payload data
+	Type      uint8    // Packet type (TypeData, TypeAuth, etc.)
+	Flags     uint8    // Additional flags
+	SessionID uint32   // Session identifier
+	SeqNum    uint32   // Sequence number
+	Data      []byte   // Payload data
+	StreamIDs []uint16 // Associated stream IDs (in-memory only)
 
 	// In-memory metadata (not encoded)
 	ICMPID  uint16

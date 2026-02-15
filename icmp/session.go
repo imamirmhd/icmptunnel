@@ -300,7 +300,28 @@ func (s *Session) GetRetransmissions() []*TunnelPacket {
 
 	var retrans []*TunnelPacket
 	now := time.Now()
-	for _, inflight := range s.inflight {
+	for seq, inflight := range s.inflight {
+		// Clean up packets for closed streams
+		if inflight.Pkt.Type == TypeData && len(inflight.Pkt.StreamIDs) > 0 {
+			anyActive := false
+			for _, sid := range inflight.Pkt.StreamIDs {
+				if _, ok := s.Streams[sid]; ok {
+					anyActive = true
+					break
+				}
+			}
+			if !anyActive {
+				delete(s.inflight, seq)
+				continue
+			}
+		}
+
+		// Enforce retry limit (avoid infinite loops for dead clients)
+		if inflight.Retries > 50 {
+			delete(s.inflight, seq)
+			continue
+		}
+
 		if now.Sub(inflight.SentAt) > s.rto {
 			inflight.SentAt = now
 			inflight.Retries++

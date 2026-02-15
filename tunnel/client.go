@@ -46,11 +46,12 @@ type Client struct {
 	reconMu            sync.Mutex
 
 	// Aggregation & Pacing
-	aggMu     sync.Mutex
-	aggData   []byte
-	aggTimer  *time.Timer
-	maxAgg    int
-	pollTicks int
+	aggMu      sync.Mutex
+	aggData    []byte
+	aggStreams map[uint16]bool
+	aggTimer   *time.Timer
+	maxAgg     int
+	pollTicks  int
 }
 
 // NewClient creates a new tunnel client.
@@ -106,10 +107,12 @@ func NewClient(cfg *config.ClientConfig) (*Client, error) {
 		streams:        make(map[uint16]chan []byte),
 		pendingStreams: make(map[uint16]chan error),
 		pendingAcks:    make(map[uint32]chan error),
+		aggData:        nil,
+		aggStreams:     make(map[uint16]bool),
 		log:            log,
-		done:       make(chan struct{}),
-		authCh:     make(chan error, 1),
-		maxAgg:     cfg.ICMP.MaxPacketSize - 64, // Leave some room
+		done:           make(chan struct{}),
+		authCh:         make(chan error, 1),
+		maxAgg:         cfg.ICMP.MaxPacketSize - 64, // Leave some room
 	}, nil
 }
 
@@ -378,6 +381,7 @@ func (c *Client) handleData(streamID uint16, data []byte) error {
 
 	c.log.Debug("Aggregating %d bytes for stream %d (current agg: %d)", len(data), streamID, len(c.aggData))
 	c.aggData = append(c.aggData, icmp.EncodeStreamData(streamID, data)...)
+	c.aggStreams[streamID] = true
 
 	if len(c.aggData) >= c.maxAgg {
 		c.flushAggBuffer()
@@ -404,6 +408,11 @@ func (c *Client) flushAggBuffer() {
 
 	data := c.aggData
 	c.aggData = nil
+	streamIDs := make([]uint16, 0, len(c.aggStreams))
+	for id := range c.aggStreams {
+		streamIDs = append(streamIDs, id)
+	}
+	c.aggStreams = make(map[uint16]bool)
 
 	// Compression
 	compressed := data
@@ -422,6 +431,7 @@ func (c *Client) flushAggBuffer() {
 		SessionID: c.session.ID,
 		SeqNum:    c.session.GetNextSeq(),
 		Data:      compressed,
+		StreamIDs: streamIDs,
 	}
 
 	c.session.RecordSent(pkt)
@@ -547,13 +557,15 @@ func (c *Client) handleClose(streamID uint16) {
 			Data:      icmp.EncodeControlMessage(icmp.ControlClose, uint32(streamID)),
 		}
 
-		select {
-		case <-c.done:
-			// If already stopping, just send it best-effort once
-			c.sendTunnelPacket(closePkt)
-		default:
-			c.sendPacketReliable(closePkt, 2*time.Second, 3)
-		}
+		go func() {
+			select {
+			case <-c.done:
+				// If already stopping, just send it best-effort once
+				c.sendTunnelPacket(closePkt)
+			default:
+				c.sendPacketReliable(closePkt, 2*time.Second, 3)
+			}
+		}()
 	}
 }
 

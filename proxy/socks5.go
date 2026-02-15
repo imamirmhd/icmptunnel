@@ -131,8 +131,10 @@ func (s *Socks5Server) handleConnection(conn net.Conn) {
 	relayWg.Add(2)
 
 	var closeOnce sync.Once
+	closeNotifier := make(chan struct{})
 	closeConn := func() {
 		closeOnce.Do(func() {
+			close(closeNotifier)
 			conn.Close()
 		})
 	}
@@ -188,6 +190,8 @@ func (s *Socks5Server) handleConnection(conn net.Conn) {
 					s.log.Debug("Write error to client: %v", err)
 					return
 				}
+			case <-closeNotifier:
+				return
 			case <-s.done:
 				return
 			}

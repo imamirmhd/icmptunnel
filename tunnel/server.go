@@ -813,6 +813,7 @@ func (s *Server) runDownlink(session *icmp.Session, stream *icmp.Stream, conn ne
 			SessionID: session.ID,
 			SeqNum:    session.GetNextSeq(),
 			Data:      finalData,
+			StreamIDs: []uint16{req.StreamID},
 		}
 		s.log.Debug("Downlink: Pushing data packet seq=%d (raw=%d, encoded=%d bytes, compressed=%v)", 
 			dataPkt.SeqNum, n, len(finalData), (flags&icmp.FlagCompressed) != 0)
