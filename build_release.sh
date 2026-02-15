@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define version
-VERSION="v1.0.0" 
+VERSION="v1.6.0" 
 
 OUTPUT_DIR="bin"
 mkdir -p "$OUTPUT_DIR"
