@@ -91,9 +91,10 @@ type Stream struct {
 }
 
 const (
-	StreamStateOpen    uint8 = 0
-	StreamStateClosing uint8 = 1
-	StreamStateClosed  uint8 = 2
+	StreamStateConnecting uint8 = 0
+	StreamStateOpen       uint8 = 1
+	StreamStateClosing    uint8 = 2
+	StreamStateClosed     uint8 = 3
 )
 
 // SessionManager manages multiple tunnel sessions.
@@ -130,8 +131,15 @@ func (sm *SessionManager) CreateSessionWithID(clientAddr net.IP, id uint32) *Ses
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	now := time.Now()
+	// Check for existing session with same ID. 
+	// We allow multiple sessions per IP (sessionsByAddr) to support NAT and simulation (localhost).
+	if old, ok := sm.sessions[id]; ok {
+		sm.log.Info("Replacing existing session %08x for client %s", id, clientAddr)
+		delete(sm.sessionsByAddr, old.ClientAddr.String())
+		old.Close()
+	}
 
+	now := time.Now()
 	session := &Session{
 		ID:           id,
 		ClientAddr:   clientAddr,
@@ -139,28 +147,20 @@ func (sm *SessionManager) CreateSessionWithID(clientAddr net.IP, id uint32) *Ses
 		LastActivity:  now,
 		Streams:       make(map[uint16]*Stream),
 		recvBuf:       make(map[uint32]*TunnelPacket),
+		NextSeqSend:   0,
 		NextRecvSeq:   0,
 		inflight:      make(map[uint32]*inflightPacket),
 		cwnd:          sm.defaultCWND,
 		ssthresh:      sm.defaultSST,
 		rto:           time.Second,
 		receivedSeqs:  make(map[uint32]bool),
-		icmpSlots:     make(chan icmpSlot, 8192), // Buffer up to 8192 slots for high concurrency
+		icmpSlots:     make(chan icmpSlot, 8192),
 		OutboundICMPID:  uint16(generateSessionID() & 0xFFFF),
 		OutboundICMPSeq: 0,
 		PushICMPID:      uint16(generateSessionID() & 0xFFFF),
 		cond:            sync.NewCond(&sync.Mutex{}),
 	}
 	session.cond.L = &session.Mu
-
-	// Check for existing session with same IP
-	if old, ok := sm.sessionsByAddr[clientAddr.String()]; ok {
-		if old.ID != id {
-			sm.log.Info("Replacing old session %08x with %08x for client %s", old.ID, id, clientAddr)
-			old.Close()
-			delete(sm.sessions, old.ID)
-		}
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	session.Ctx = ctx
@@ -391,8 +391,8 @@ func (s *Session) GetCWND() int {
 
 // GenerateSACK creates a SACK message based on received packets.
 func (s *Session) GenerateSACK() *SACK {
-	s.Mu.Lock()
-	defer s.Mu.Unlock()
+	s.Mu.RLock()
+	defer s.Mu.RUnlock()
 
 	sack := &SACK{
 		AckedSeq: s.NextRecvSeq - 1,
@@ -605,6 +605,11 @@ func (s *Session) AddStream(protocol, destination string) *Stream {
 	return stream
 }
 
+// SetState sets the stream state.
+func (s *Stream) SetState(state uint8) {
+	s.State = state
+}
+
 // AddStreamWithID adds a new data stream to the session with a specific ID.
 func (s *Session) AddStreamWithID(id uint16, protocol, destination string) *Stream {
 	s.Mu.Lock()
@@ -614,9 +619,10 @@ func (s *Session) AddStreamWithID(id uint16, protocol, destination string) *Stre
 		ID:          id,
 		Protocol:    protocol,
 		Destination: destination,
-		DataChan:    make(chan []byte, 4096),
+		DataChan:    make(chan []byte, 16384),
 		Done:        make(chan struct{}),
 		CreatedAt:   time.Now(),
+		State:       StreamStateConnecting,
 	}
 	s.Streams[id] = stream
 	return stream
@@ -674,6 +680,7 @@ func (sm *SessionManager) cleanupLoop() {
 // Close terminates the session and all its streams.
 func (s *Session) Close() {
 	s.Mu.Lock()
+	s.Authenticated = false
 	if s.Cancel != nil {
 		s.Cancel()
 	}
@@ -694,6 +701,16 @@ func (sm *SessionManager) ActiveSessions() int {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return len(sm.sessions)
+}
+
+// GetSessionIDByAddr returns the current SessionID for a client IP.
+func (sm *SessionManager) GetSessionIDByAddr(addr net.IP) uint32 {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if session, ok := sm.sessionsByAddr[addr.String()]; ok {
+		return session.ID
+	}
+	return 0
 }
 
 func generateSessionID() uint32 {

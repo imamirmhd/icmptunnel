@@ -15,9 +15,11 @@
 | **ICMP Spoofing** | Relay-based spoofing for environments where direct ICMP is blocked |
 | **Transport Layer** | **NEW!** 32-bit sequence numbers, backpressure, sliding window, SACK, and reliable retransmissions |
 | **Authentication** | Unified token-based validation for both session auth and ICMP connectivity |
+| **Session Isolation** | **NEW!** Multiple concurrent clients on a single IP (localhost) with strict `SessionID` separation |
+| **Resource Limits** | **NEW!** Enforce `max_streams` per session to prevent resource exhaustion under load |
 | **User-Space ICMP** | Application-level echo replies for reliability when kernel replies are disabled |
 | **Diagnostics** | Ping, throughput, packet loss, DPI detection, spoof verification |
-| **Performance** | Supports transfers of **1GB and larger** without stalling or data loss |
+| **Performance** | **High Capacity!** 64-worker server architecture with `icmpID` load balancing |
 | **Service Management** | systemd integration with install, start/stop/restart, logs |
 | **TOML Configuration** | Fully configurable via human-readable TOML files |
 
@@ -309,6 +311,23 @@ sudo ./icmptunnel relay --config relay.toml
 ```
 
 > ⚠️ IP spoofing requires: root privileges, `rp_filter=0` on the client, and a relay that does not drop forged-source packets.
+
+## Multi-Client Isolation & Capacity
+
+**icmptunnel v1.7.0** is optimized for high-concurrency environments and local simulations where multiple clients share a single IP address:
+
+### Key Improvements:
+- **Session ID Mapping**: Every connection is keyed by `SessionID:StreamID` instead of IP, allowing infinite client density on a single IP.
+- **Worker Pool Scaling**: Server logic is distributed across **64 workers** using `icmpID` consistent hashing to maximize multi-core utilization.
+- **Race Condition Resilience**: The `StreamStateConnecting` state ensures that high-burst data packets are buffered correctly while the initial TCP/UDP dial is in progress.
+- **Resource Guarding**: Configurable `max_streams` per session (default: unlimited) protects the server from targeted resource exhaustion attacks.
+
+### Capacity Tuning:
+```toml
+[transport]
+window_size = 2048   # Aggressive window for high-latency/high-bandwidth links
+max_streams = 100    # Prevent a single session from consuming too many system resources
+```
 
 ## Transport Layer & Reliability
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/user/icmptunnel/auth"
@@ -36,7 +37,7 @@ type Client struct {
 	pendingMu      sync.Mutex
 	socks5     []*proxy.Socks5Server
 	forwarders []*proxy.Forwarder
-	lastServerActivity time.Time
+	lastActivityNano   int64 // atomic unix nano
 	log                *logger.Logger
 	done               chan struct{}
 	wg                 sync.WaitGroup
@@ -59,6 +60,14 @@ type Client struct {
 	jobQueue   chan *packetJob
 	sendQueue  chan *sendJob
 	ctrlQueue  chan *sendJob
+	highCtrlQueue chan *sendJob // Priority for Auth and Connect
+
+	// Stats (atomic)
+	reconnectCount uint64
+	txBytes        uint64
+	rxBytes        uint64
+	txPackets      uint64
+	rxPackets      uint64
 }
 
 // NewClient creates a new tunnel client.
@@ -120,9 +129,10 @@ func NewClient(cfg *config.ClientConfig) (*Client, error) {
 		done:           make(chan struct{}),
 		authCh:         make(chan error, 1),
 		maxAgg:         cfg.ICMP.MaxPacketSize - 64, // Leave some room
-		jobQueue:       make(chan *packetJob, 16384),
-		sendQueue:      make(chan *sendJob, 16384),
-		ctrlQueue:      make(chan *sendJob, 1024),
+		jobQueue:       make(chan *packetJob, 65536),
+		sendQueue:      make(chan *sendJob, 32768),
+		ctrlQueue:      make(chan *sendJob, 32768),
+		highCtrlQueue:  make(chan *sendJob, 1024),
 	}, nil
 }
 
@@ -378,7 +388,7 @@ func (c *Client) handleConnect(protocol, destination string) (uint16, chan []byt
 	}
 
 	c.log.Debug("Generated streamID %d for connection to %s", streamID, destination)
-	responseChan := make(chan []byte, 8192)
+	responseChan := make(chan []byte, 16384)
 	statusChan := make(chan error, 1)
 
 	c.streamsMu.Lock()
@@ -457,8 +467,13 @@ func (c *Client) handleData(streamID uint16, data []byte) error {
 		return fmt.Errorf("stream %d closed", streamID)
 	}
 
+	encoded := icmp.EncodeStreamData(streamID, data)
+	if len(c.aggData)+len(encoded) > c.maxAgg {
+		c.flushAggBuffer()
+	}
+
 	c.log.Debug("Aggregating %d bytes for stream %d (current agg: %d)", len(data), streamID, len(c.aggData))
-	c.aggData = append(c.aggData, icmp.EncodeStreamData(streamID, data)...)
+	c.aggData = append(c.aggData, encoded...)
 	c.aggStreams[streamID] = true
 
 	if len(c.aggData) >= c.maxAgg {
@@ -533,7 +548,7 @@ func (c *Client) retransmitLoop() {
 			return
 		case <-ticker.C:
 			session := c.getSession()
-			if session == nil {
+			if session == nil || !session.Authenticated {
 				continue
 			}
 			retrans := session.GetRetransmissions()
@@ -674,10 +689,10 @@ func (c *Client) handleClose(streamID uint16) {
 
 func (c *Client) sendPacketReliable(pkt *icmp.TunnelPacket, timeout time.Duration, maxRetries int) error {
 	if timeout <= 0 {
-		timeout = 3 * time.Second
+		timeout = 5 * time.Second
 	}
 	if maxRetries <= 0 {
-		maxRetries = 10
+		maxRetries = 15
 	}
 	
 	ackChan := make(chan error, 1)
@@ -741,7 +756,15 @@ func (c *Client) sendToStream(streamID uint16, data []byte) {
 }
 
 func (c *Client) sendTunnelPacket(pkt *icmp.TunnelPacket) error {
-	priority := pkt.Type == icmp.TypeAuth || pkt.Type == icmp.TypeControl
+	highPriority := pkt.Type == icmp.TypeAuth
+	if pkt.Type == icmp.TypeControl && len(pkt.Data) > 0 {
+		subtype := pkt.Data[0]
+		if subtype == icmp.ControlConnect || subtype == icmp.ControlAuthOK || subtype == icmp.ControlAuthFail {
+			highPriority = true
+		}
+	}
+	priority := highPriority || pkt.Type == icmp.TypeControl
+
 	if c.cfg.Encryption.Enabled {
 		pkt.Flags |= icmp.FlagEncrypted
 	}
@@ -772,7 +795,7 @@ func (c *Client) sendTunnelPacket(pkt *icmp.TunnelPacket) error {
 		// Use stable outbound ICMP flow
 		icmpID := session.OutboundICMPID
 		icmpSeq := session.GetNextICMPSeq()
-		if err := c.sendICMP(p, icmpID, icmpSeq, priority); err != nil {
+		if err := c.sendICMP(p, icmpID, icmpSeq, priority, highPriority); err != nil {
 			return err
 		}
 	}
@@ -780,7 +803,7 @@ func (c *Client) sendTunnelPacket(pkt *icmp.TunnelPacket) error {
 	return nil
 }
 
-func (c *Client) sendICMP(payload []byte, icmpID, icmpSeq uint16, priority bool) error {
+func (c *Client) sendICMP(payload []byte, icmpID, icmpSeq uint16, priority, highPriority bool) error {
 	if c.cfg.Spoof.Enabled {
 		spoofHdr := &icmp.SpoofHeader{
 			RealClientIP: c.localAddr,
@@ -802,11 +825,14 @@ func (c *Client) sendICMP(payload []byte, icmpID, icmpSeq uint16, priority bool)
 	c.log.Debug("Sending ICMP Echo Request to server %s, ID=%d, Seq=%d", c.serverAddr, icmpID, icmpSeq)
 	
 	// Queue send
-	c.queueSend(c.localAddr, c.serverAddr, icmpID, icmpSeq, payload, false, priority)
+	c.queueSend(c.localAddr, c.serverAddr, icmpID, icmpSeq, payload, false, priority, highPriority)
 	return nil
 }
 
-func (c *Client) queueSend(srcIP, destIP net.IP, icmpID, icmpSeq uint16, payload []byte, isReply bool, priority bool) {
+func (c *Client) queueSend(srcIP, destIP net.IP, icmpID, icmpSeq uint16, payload []byte, isReply bool, priority, highPriority bool) {
+	atomic.AddUint64(&c.txBytes, uint64(len(payload)))
+	atomic.AddUint64(&c.txPackets, 1)
+
 	job := &sendJob{
 		srcIP:   srcIP,
 		destIP:  destIP,
@@ -816,15 +842,21 @@ func (c *Client) queueSend(srcIP, destIP net.IP, icmpID, icmpSeq uint16, payload
 		reply:   isReply,
 	}
 
-	queue := c.sendQueue
-	if priority {
+	var queue chan *sendJob
+	if highPriority {
+		queue = c.highCtrlQueue
+	} else if priority {
 		queue = c.ctrlQueue
+	} else {
+		queue = c.sendQueue
 	}
 
 	select {
 	case queue <- job:
 	default:
-		if priority {
+		if highPriority {
+			c.log.Warn("High priority queue full, dropping packet to %s", destIP)
+		} else if priority {
 			c.log.Warn("Priority queue full, dropping packet to %s", destIP)
 		} else {
 			c.log.Warn("Send queue full, dropping packet to %s", destIP)
@@ -839,18 +871,21 @@ func (c *Client) senderLoop() {
 		select {
 		case <-c.done:
 			return
-		case job = <-c.ctrlQueue:
-			// Priority job
+		case job = <-c.highCtrlQueue:
+			// Highest priority (Auth, Connect)
 		default:
-			// No priority job, check data queue
+			// Check other queues fairly
 			select {
 			case <-c.done:
 				return
+			case job = <-c.highCtrlQueue:
 			case job = <-c.ctrlQueue:
-				// Priority job arrived
 			case job = <-c.sendQueue:
-				// Data job
 			}
+		}
+
+		if job == nil {
+			continue // No job available, loop again
 		}
 
 		var err error
@@ -989,6 +1024,7 @@ func (c *Client) processPacketJob(job *packetJob) {
 		}
 		
 		c.sessionMgr.TouchSession(tunnelPkt.SessionID)
+		atomic.StoreInt64(&c.lastActivityNano, time.Now().UnixNano())
 	}
 }
 
@@ -1009,9 +1045,11 @@ func (c *Client) receiveLoop() {
 			if origBuf != nil {
 				icmp.ReleaseBuffer(origBuf)
 			}
-			// ... (existing error handling)
 			continue
 		}
+
+		atomic.AddUint64(&c.rxBytes, uint64(len(rawPayload)))
+		atomic.AddUint64(&c.rxPackets, 1)
 
 		// Client accepts Echo Reply (0) and Echo Request (8).
 		// Echo Requests from the server are "push" packets for high-throughput downlink.
@@ -1108,7 +1146,7 @@ func (c *Client) receiveLoop() {
 func (c *Client) heartbeatLoop() {
 	defer c.wg.Done()
 	heartbeatTicker := time.NewTicker(10 * time.Second)
-	pollTicker := time.NewTicker(2 * time.Millisecond)
+	pollTicker := time.NewTicker(50 * time.Millisecond)
 	defer heartbeatTicker.Stop()
 	defer pollTicker.Stop()
 
@@ -1117,7 +1155,7 @@ func (c *Client) heartbeatLoop() {
 	go c.receiveLoop()
 
 	// Initial activity
-	c.lastServerActivity = time.Now()
+	atomic.StoreInt64(&c.lastActivityNano, time.Now().UnixNano())
 
 	for {
 		select {
@@ -1125,7 +1163,7 @@ func (c *Client) heartbeatLoop() {
 			return
 		case <-heartbeatTicker.C:
 			session := c.getSession()
-			if session == nil {
+			if session == nil || !session.Authenticated {
 				continue
 			}
 
@@ -1143,7 +1181,8 @@ func (c *Client) heartbeatLoop() {
 			go c.sendTunnelPacket(pkt)
 
 			// Check for timeout
-			if time.Since(c.lastServerActivity) > 60*time.Second {
+			lastActivity := atomic.LoadInt64(&c.lastActivityNano)
+			if time.Since(time.Unix(0, lastActivity)) > 60*time.Second {
 				c.log.Warn("Tunnel timeout, attempting to reconnect...")
 				c.triggerReconnect()
 			}
@@ -1173,13 +1212,13 @@ func (c *Client) heartbeatLoop() {
 			if activeStreams == 0 {
 				burstSize = 1
 			} else if activeStreams >= 40 {
-				burstSize = activeStreams + 20
+				burstSize = 20 // Cap it!
 			} else if activeStreams >= 20 {
-				burstSize = activeStreams + 10
+				burstSize = 15
 			} else if activeStreams >= 5 {
-				burstSize = activeStreams + 5
-			} else {
 				burstSize = 10
+			} else {
+				burstSize = 5
 			}
 
 			for i := 0; i < burstSize; i++ {
@@ -1190,7 +1229,7 @@ func (c *Client) heartbeatLoop() {
 					SeqNum:    0, // SACK polls don't need to be reliable/sequenced
 					Data:      icmp.EncodeSACK(sack),
 				}
-				go c.sendTunnelPacket(sackPkt)
+				c.sendTunnelPacket(sackPkt)
 			}
 		}
 	}
@@ -1208,6 +1247,7 @@ func (c *Client) triggerReconnect() {
 }
 
 func (c *Client) reconnect() {
+	atomic.AddUint64(&c.reconnectCount, 1)
 	defer func() {
 		c.reconMu.Lock()
 		c.reconnecting = false
@@ -1226,6 +1266,39 @@ func (c *Client) reconnect() {
 
 		c.log.Info("Reconnecting... (backoff %v)", backoff)
 		
+		// 1. Flush queues to prevent stale packets from old session triggering AuthFail
+	flushLoop:
+		for {
+			select {
+			case <-c.sendQueue:
+			case <-c.ctrlQueue:
+			case <-c.highCtrlQueue:
+			default:
+				break flushLoop
+			}
+		}
+
+		// 2. Abort all pending ACKs and stream establishments
+		c.abortPending(fmt.Errorf("client reconnecting"))
+
+		// 3. Clear aggregation state
+		c.aggMu.Lock()
+		c.aggData = nil
+		c.aggStreams = make(map[uint16]bool)
+		if c.aggTimer != nil {
+			c.aggTimer.Stop()
+			c.aggTimer = nil
+		}
+		c.aggMu.Unlock()
+
+		// 4. Create new session
+		c.sessionMu.RLock()
+		oldSession := c.session
+		c.sessionMu.RUnlock()
+		if oldSession != nil {
+			oldSession.Close()
+		}
+
 		// Reuse existing session manager to avoid leaking cleanup loops
 		newSession := c.sessionMgr.CreateSession(c.serverAddr)
 		newSession.AuthToken = c.cfg.AuthToken
@@ -1234,9 +1307,20 @@ func (c *Client) reconnect() {
 		c.session = newSession
 		c.sessionMu.Unlock()
 
+		// 5. Clear streams - they are dead now
+		c.streamsMu.Lock()
+		c.streams = make(map[uint16]chan []byte)
+		c.streamsMu.Unlock()
+
+		// 6. Drain authCh to avoid stale auth results
+		select {
+		case <-c.authCh:
+		default:
+		}
+
 		if err := c.authenticate(); err == nil {
 			c.log.Info("Reconnected successfully")
-			c.lastServerActivity = time.Now()
+			atomic.StoreInt64(&c.lastActivityNano, time.Now().UnixNano())
 			return
 		}
 
@@ -1309,4 +1393,13 @@ func (c *Client) calculateMaxStreamData() int {
 	}
 	c.log.Debug("Calculated max stream data size: %d", room)
 	return room
+}
+
+// GetStats returns the current client statistics.
+func (c *Client) GetStats() (reconnects, txBytes, rxBytes, txPackets, rxPackets uint64) {
+	return atomic.LoadUint64(&c.reconnectCount),
+		atomic.LoadUint64(&c.txBytes),
+		atomic.LoadUint64(&c.rxBytes),
+		atomic.LoadUint64(&c.txPackets),
+		atomic.LoadUint64(&c.rxPackets)
 }

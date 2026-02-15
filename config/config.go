@@ -61,6 +61,7 @@ type TransportConfig struct {
 	Compression           bool   `toml:"compression"`
 	StreamCount           int    `toml:"stream_count"`
 	PacingAggressiveness  int    `toml:"pacing_aggressiveness"`
+	MaxStreams            int    `toml:"max_streams"`
 }
 
 // EncryptionConfig holds encryption settings.
@@ -277,6 +278,7 @@ func DefaultTransportConfig() TransportConfig {
 		Compression:           true,
 		StreamCount:           4,
 		PacingAggressiveness:  5,
+		MaxStreams:            1024,
 	}
 }
 

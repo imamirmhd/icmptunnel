@@ -34,9 +34,15 @@ type Server struct {
 	wg         sync.WaitGroup
 
 	// Worker Pool & Sender
-	jobQueue   chan *packetJob
-	sendQueue  chan *sendJob
-	ctrlQueue  chan *sendJob
+	workerQueues []chan *packetJob
+	sendQueue    chan *sendJob
+	ctrlQueue    chan *sendJob
+	highCtrlQueue chan *sendJob // Priority for Auth and Connect
+
+	// Session Sync protection
+	staleSessions map[uint32]time.Time
+	staleMu       sync.Mutex
+	authFailLimit map[uint32]time.Time // SessionID -> Last Fail Sent
 }
 
 type packetJob struct {
@@ -100,7 +106,7 @@ func NewServer(cfg *config.ServerConfig) (*Server, error) {
 	ev := evasion.NewManager(cfg.Evasion)
 	validator := auth.NewValidator(cfg.AuthTokens)
 
-	return &Server{
+	s := &Server{
 		cfg:           cfg,
 		socket:        sock,
 		encryptor:     enc,
@@ -111,10 +117,17 @@ func NewServer(cfg *config.ServerConfig) (*Server, error) {
 		connecting:    make(map[string]bool),
 		log:           log,
 		done:          make(chan struct{}),
-		jobQueue:      make(chan *packetJob, 16384),
-		sendQueue:     make(chan *sendJob, 16384),
-		ctrlQueue:     make(chan *sendJob, 1024),
-	}, nil
+		sendQueue:     make(chan *sendJob, 32768),
+		ctrlQueue:     make(chan *sendJob, 32768),
+		highCtrlQueue: make(chan *sendJob, 1024),
+		staleSessions: make(map[uint32]time.Time),
+		authFailLimit: make(map[uint32]time.Time),
+	}
+	s.workerQueues = make([]chan *packetJob, 64)
+	for i := 0; i < 64; i++ {
+		s.workerQueues[i] = make(chan *packetJob, 32768)
+	}
+	return s, nil
 }
 
 // Start runs the tunnel server.
@@ -130,13 +143,12 @@ func (s *Server) Start() error {
 	}
 
 	// Start loops
-	// Start loops
-	s.wg.Add(2 + 16 + 1) // Receiver + 16 Workers + Sender
+	s.wg.Add(2 + len(s.workerQueues) + 1) // Receiver + Workers + Sender
 	go s.receiveLoop()
 	go s.retransmitLoop()
 	go s.senderLoop()
-	for i := 0; i < 16; i++ {
-		go s.workerLoop(i)
+	for i := 0; i < len(s.workerQueues); i++ {
+		go s.workerLoop(i, s.workerQueues[i])
 	}
 
 	return nil
@@ -162,6 +174,11 @@ func (s *Server) Stop() {
 	if s.cfg.Firewall.DisableEchoReply {
 		s.enableEchoReply()
 	}
+}
+
+// ActiveSessions returns the number of active sessions.
+func (s *Server) ActiveSessions() int {
+	return s.sessionMgr.ActiveSessions()
 }
 
 // Wait blocks until the server is stopped.
@@ -236,17 +253,23 @@ func (s *Server) receiveLoop() {
 			origBuf:  origBuf,
 		}
 
+		// Dispatch to worker based on source IP to ensure sequential processing for each client
+		// Use icmpID for hashing to distribute load even if all clients share one IP (simulation)
+		workerID := uint32(icmpID) % uint32(len(s.workerQueues))
+
 		select {
-		case s.jobQueue <- job:
+		case s.workerQueues[workerID] <- job:
 		default:
-			s.log.Warn("Job queue full, dropping packet from %s", srcIP)
+			s.log.Warn("Worker %d queue full, dropping packet from %s", workerID, srcIP)
 			icmp.ReleaseBuffer(origBuf)
 		}
 	}
 }
 
-func (s *Server) workerLoop(id int) {
+func (s *Server) workerLoop(id int, queue chan *packetJob) {
 	defer s.wg.Done()
+	s.log.Debug("Worker %d starting", id)
+	
 	// fragBuf := evasion.NewFragmentBuffer() // Each worker needs its own? No, fragmentation MUST be sequential per source.
 	// WAIT. Fragmentation handling in ReceiveLoop is tricky if we want to use worker pool.
 	// But `evasion.NewFragmentBuffer` is just a buffer?
@@ -270,7 +293,7 @@ func (s *Server) workerLoop(id int) {
 	
 	// We'll move the worker logic here.
 	
-	for job := range s.jobQueue {
+	for job := range queue {
 		s.processPacketJob(job)
 	}
 }
@@ -283,6 +306,12 @@ func (s *Server) processPacketJob(job *packetJob) {
 	icmpID := job.icmpID
 	icmpSeq := job.icmpSeq
 	rawPayload := job.payload
+
+	// On localhost, we receive our own outbound packets.
+	// Only process Echo Requests (Type 8) from clients.
+	if icmpType != 8 {
+		return
+	}
 
 	// Check for spoofed packets
 	var realClientIP net.IP
@@ -362,7 +391,7 @@ func (s *Server) processPacketJob(job *packetJob) {
 				s.log.Debug("Received valid authorized ping from %s", srcIP)
 				localIP := s.getLocalIP(srcIP)
 				// Use queueSend
-				s.queueSend(localIP, srcIP, icmpID, icmpSeq, rawPayload, true, false)
+				s.queueSend(localIP, srcIP, icmpID, icmpSeq, rawPayload, true, false, false)
 			}
 		}
 		return
@@ -376,7 +405,7 @@ func (s *Server) processPacketJob(job *packetJob) {
 			if isValid {
 				s.log.Debug("Received valid authorized ping from %s (decoded flow)", srcIP)
 				localIP := s.getLocalIP(srcIP)
-				s.queueSend(localIP, srcIP, icmpID, icmpSeq, rawPayload, true, false)
+				s.queueSend(localIP, srcIP, icmpID, icmpSeq, rawPayload, true, false, false)
 			} else {
 				s.log.Debug("Decode tunnel packet failed: %v", err)
 			}
@@ -421,17 +450,16 @@ func (s *Server) senderLoop() {
 		select {
 		case <-s.done:
 			return
-		case job = <-s.ctrlQueue:
-			// Priority job
+		case job = <-s.highCtrlQueue:
+			// Highest priority (Auth, Connect)
 		default:
-			// No priority job, check data queue
+			// Check other queues fairly
 			select {
 			case <-s.done:
 				return
+			case job = <-s.highCtrlQueue:
 			case job = <-s.ctrlQueue:
-				// Priority job arrived
 			case job = <-s.sendQueue:
-				// Data job
 			}
 		}
 
@@ -449,7 +477,7 @@ func (s *Server) senderLoop() {
 }
 
 // Helper to queue response
-func (s *Server) queueSend(srcIP, destIP net.IP, icmpID, icmpSeq uint16, payload []byte, isReply bool, priority bool) {
+func (s *Server) queueSend(srcIP, destIP net.IP, icmpID, icmpSeq uint16, payload []byte, isReply bool, priority, highPriority bool) {
 	job := &sendJob{
 		srcIP:   srcIP,
 		destIP:  destIP,
@@ -459,15 +487,21 @@ func (s *Server) queueSend(srcIP, destIP net.IP, icmpID, icmpSeq uint16, payload
 		reply:   isReply,
 	}
 
-	queue := s.sendQueue
-	if priority {
+	var queue chan *sendJob
+	if highPriority {
+		queue = s.highCtrlQueue
+	} else if priority {
 		queue = s.ctrlQueue
+	} else {
+		queue = s.sendQueue
 	}
 
 	select {
 	case queue <- job:
 	default:
-		if priority {
+		if highPriority {
+			s.log.Warn("High priority queue full, dropping packet to %s", destIP)
+		} else if priority {
 			s.log.Warn("Priority queue full, dropping packet to %s", destIP)
 		} else {
 			s.log.Warn("Send queue full, dropping packet to %s", destIP)
@@ -529,8 +563,32 @@ func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 			}
 		}
 		if pkt.Type != icmp.TypeAuth && (session == nil || !session.Authenticated) {
-			s.log.Debug("Packet from unauthenticated session %08x", pkt.SessionID)
+			if session == nil {
+				s.log.Debug("Packet from unknown session %08x (type %d, seq %d)", pkt.SessionID, pkt.Type, pkt.SeqNum)
+			} else {
+				s.log.Debug("Packet from unauthenticated session %08x (type %d, seq %d)", pkt.SessionID, pkt.Type, pkt.SeqNum)
+			}
 			
+			// 1. Check if this is a recently replaced session (stale)
+			s.staleMu.Lock()
+			if expiry, ok := s.staleSessions[pkt.SessionID]; ok {
+				if time.Now().Before(expiry) {
+					s.staleMu.Unlock()
+					return // Quietly drop stale packets
+				}
+				delete(s.staleSessions, pkt.SessionID)
+			}
+			
+			// 2. Throttle AuthFail responses (max 1 per second per SessionID)
+			if lastSent, ok := s.authFailLimit[pkt.SessionID]; ok {
+				if time.Since(lastSent) < time.Second {
+					s.staleMu.Unlock()
+					return
+				}
+			}
+			s.authFailLimit[pkt.SessionID] = time.Now()
+			s.staleMu.Unlock()
+
 			// Send AuthFail to trigger client reconnect
 			failPkt := &icmp.TunnelPacket{
 				Type:      icmp.TypeControl,
@@ -538,10 +596,6 @@ func (s *Server) handlePacket(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 				SeqNum:    0,
 				Data:      icmp.EncodeControlMessage(icmp.ControlAuthFail, 0),
 			}
-			// We can't use session.RecordSent because we don't have a session.
-			// Just send it directly.
-			// Need to find which address to send to.
-			// handlePacket has srcIP.
 			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, pkt.ICMPID, pkt.ICMPSeq, failPkt)
 			return
 		}
@@ -622,18 +676,21 @@ func (s *Server) handleAuth(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 		if session != nil && session.Authenticated && session.AuthToken == token {
 			s.log.Debug("Re-authenticating existing session %08x", pkt.SessionID)
 		} else {
-			// Proactively cleanup old connections for this IP
+			// Proactively cleanup old connections for this specific session ID (if any existed)
 			s.connMu.Lock()
-			prefix := clientIP.String() + ":"
-			for key, conn := range s.connections {
+			prefix := fmt.Sprintf("%08x:", pkt.SessionID)
+			for key := range s.connections {
 				if strings.HasPrefix(key, prefix) {
-					s.log.Info("Cleaning up stale connection %s due to client restart", key)
-					conn.Close()
-					delete(s.connections, key)
+					if conn, ok := s.connections[key]; ok {
+						conn.Close()
+						delete(s.connections, key)
+						s.log.Info("Cleaning up stale connection %s due to session restart", key)
+					}
 				}
 			}
 			s.connMu.Unlock()
 
+			// Create new session - will atomically replace any old one with same ID in mgr
 			session = s.sessionMgr.CreateSessionWithID(clientIP, pkt.SessionID)
 			session.Authenticated = true
 			session.AuthToken = token
@@ -680,15 +737,7 @@ func (s *Server) handleData(clientIP, srcIP net.IP, routeFlag uint8, relayIP net
 		session.Mu.RUnlock()
 
 		if !streamExists {
-			s.log.Warn("Data for unknown stream %d in session %08x - sending ControlClose", entry.StreamID, session.ID)
-			// Send ControlClose to client to sync state
-			closePkt := &icmp.TunnelPacket{
-				Type:      icmp.TypeControl,
-				SessionID: session.ID,
-				SeqNum:    0,
-				Data:      icmp.EncodeControlMessage(icmp.ControlClose, uint32(entry.StreamID)),
-			}
-			go s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, closePkt)
+			s.log.Warn("Data for unknown stream %d in session %08x - dropping (may be establishing)", entry.StreamID, session.ID)
 			continue
 		}
 
@@ -750,13 +799,17 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 		}
 
 		streamID := req.StreamID
-		connKey := fmt.Sprintf("%s:%d", clientIP, streamID)
+		connKey := fmt.Sprintf("%08x:%d", session.ID, streamID)
 		
 		s.connMu.RLock()
 		_, exists := s.connections[connKey]
 		s.connMu.RUnlock()
+
+		session.Mu.RLock()
+		_, streamExists := session.Streams[streamID]
+		session.Mu.RUnlock()
 		
-		if exists {
+		if exists && streamExists {
 			s.log.Debug("Connection for stream %s already exists, re-acknowledging", connKey)
 			ackPkt := &icmp.TunnelPacket{
 				Type:      icmp.TypeControl,
@@ -766,6 +819,28 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 			}
 			session.RecordSent(ackPkt)
 			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
+			return
+		}
+
+		if exists || streamExists {
+			s.log.Debug("Stream %s establishment in progress, ignoring retry", connKey)
+			return
+		}
+
+		// Enforce MaxStreams limit per session
+		session.Mu.RLock()
+		numStreams := len(session.Streams)
+		session.Mu.RUnlock()
+		if s.cfg.Transport.MaxStreams > 0 && numStreams >= s.cfg.Transport.MaxStreams {
+			s.log.Warn("Session %08x reached max streams (%d), rejecting connect", session.ID, s.cfg.Transport.MaxStreams)
+			failPkt := &icmp.TunnelPacket{
+				Type:      icmp.TypeControl,
+				SessionID: session.ID,
+				SeqNum:    session.GetNextSeq(),
+				Data:      icmp.EncodeControlMessage(icmp.ControlConnectFail, uint32(req.StreamID)),
+			}
+			session.RecordSent(failPkt)
+			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, failPkt)
 			return
 		}
 
@@ -782,71 +857,8 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 		s.connecting[connKey] = true
 		s.connMu.Unlock()
 
-		// Handle Connect asynchronously to avoid blocking the receiver loop
-		go func() {
-			defer func() {
-				s.connMu.Lock()
-				delete(s.connecting, connKey)
-				s.connMu.Unlock()
-			}()
-
-			s.log.Info("Connect request: stream=%d proto=%s dest=%s from %s",
-				req.StreamID, req.Protocol, req.Destination, clientIP)
-
-			// Establish connection to destination
-			var conn net.Conn
-			var dErr error
-			switch req.Protocol {
-			case "tcp":
-				conn, dErr = net.DialTimeout("tcp", req.Destination, 10*time.Second)
-			case "udp":
-				conn, dErr = net.DialTimeout("udp", req.Destination, 10*time.Second)
-			default:
-				s.log.Error("Unsupported protocol: %s", req.Protocol)
-				return
-			}
-
-			if dErr != nil {
-				// Retry with IPv6 formatting if it contains a colon and isn't bracketed
-				dest := req.Destination
-				if strings.Contains(dest, ":") && !strings.HasPrefix(dest, "[") {
-					lastColon := strings.LastIndex(dest, ":")
-					if lastColon != -1 {
-						host := dest[:lastColon]
-						port := dest[lastColon+1:]
-						ipv6Dest := net.JoinHostPort(host, port)
-						s.log.Debug("Retrying connection with IPv6 formatting: %s", ipv6Dest)
-						conn, dErr = net.DialTimeout(req.Protocol, ipv6Dest, 10*time.Second)
-					}
-				}
-			}
-
-			if dErr != nil {
-				s.log.Error("Connect to %s failed: %v", req.Destination, dErr)
-				failPkt := &icmp.TunnelPacket{
-					Type:      icmp.TypeControl,
-					SessionID: session.ID,
-					SeqNum:    session.GetNextSeq(),
-					Data:      icmp.EncodeControlMessage(icmp.ControlConnectFail, uint32(req.StreamID)),
-				}
-				session.RecordSent(failPkt)
-				s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, failPkt)
-				return
-			}
-
-			// SAFETY CHECK: Ensure the session is still active and authenticated.
-			// If a ControlClose arrived while dialing, or the session timed out, abort.
-			if session.Ctx.Err() != nil {
-				s.log.Warn("Session %08x closed while dialing %s, aborting stream", session.ID, req.Destination)
-				conn.Close()
-				return
-			}
-
-			s.connMu.Lock()
-			s.connections[connKey] = conn
-			s.connMu.Unlock()
-
 			stream := session.AddStreamWithID(req.StreamID, req.Protocol, req.Destination)
+			stream.SetState(icmp.StreamStateConnecting)
 
 			// Send connect ACK
 			ackPkt := &icmp.TunnelPacket{
@@ -857,13 +869,52 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 			}
 			session.RecordSent(ackPkt)
 			s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, ackPkt)
-			s.log.Info("Stream %d established to %s", req.StreamID, req.Destination)
 
-			// Start Uplink/Downlink loops
-			s.wg.Add(2)
-			go s.runUplink(session, stream, conn, connKey, req)
-			go s.runDownlink(session, stream, conn, connKey, clientIP, srcIP, routeFlag, relayIP, req)
-		}()
+			// Handle Connect asynchronously for the heavy Dial part
+			go func() {
+				defer func() {
+					s.connMu.Lock()
+					delete(s.connecting, connKey)
+					s.connMu.Unlock()
+				}()
+
+				s.log.Info("Dialing destination: stream=%d proto=%s dest=%s", req.StreamID, req.Protocol, req.Destination)
+
+				var conn net.Conn
+				var dErr error
+				switch req.Protocol {
+				case "tcp":
+					conn, dErr = net.DialTimeout("tcp", req.Destination, 10*time.Second)
+				case "udp":
+					conn, dErr = net.DialTimeout("udp", req.Destination, 10*time.Second)
+				}
+
+				if dErr != nil {
+					s.log.Error("Connect to %s failed: %v", req.Destination, dErr)
+					failPkt := &icmp.TunnelPacket{
+						Type:      icmp.TypeControl,
+						SessionID: session.ID,
+						SeqNum:    session.GetNextSeq(),
+						Data:      icmp.EncodeControlMessage(icmp.ControlConnectFail, uint32(req.StreamID)),
+					}
+					session.RecordSent(failPkt)
+					s.sendResponse(clientIP, srcIP, routeFlag, relayIP, icmpID, icmpSeq, failPkt)
+					session.RemoveStream(req.StreamID)
+					return
+				}
+
+				s.connMu.Lock()
+				s.connections[connKey] = conn
+				s.connMu.Unlock()
+
+				stream.SetState(icmp.StreamStateOpen)
+				s.log.Info("Stream %d established to %s", req.StreamID, req.Destination)
+
+				// Start Uplink/Downlink loops
+				s.wg.Add(2)
+				go s.runUplink(session, stream, conn, connKey, req)
+				go s.runDownlink(session, stream, conn, connKey, clientIP, srcIP, routeFlag, relayIP, req)
+			}()
 
 	case icmp.ControlACK:
 		if session != nil {
@@ -877,7 +928,7 @@ func (s *Server) handleControl(clientIP, srcIP net.IP, routeFlag uint8, relayIP 
 			}
 		}
 	case icmp.ControlClose:
-		connKey := fmt.Sprintf("%s:%d", clientIP, streamID)
+		connKey := fmt.Sprintf("%08x:%d", session.ID, streamID)
 		s.connMu.Lock()
 		if conn, ok := s.connections[connKey]; ok {
 			conn.Close()
@@ -1085,7 +1136,14 @@ func (s *Server) calculateMaxStreamData() int {
 }
 
 func (s *Server) sendResponse(clientIP, srcIP net.IP, routeFlag uint8, relayIP net.IP, icmpID, icmpSeq uint16, pkt *icmp.TunnelPacket) error {
-	priority := pkt.Type == icmp.TypeAuth || pkt.Type == icmp.TypeControl
+	highPriority := pkt.Type == icmp.TypeAuth
+	if pkt.Type == icmp.TypeControl && len(pkt.Data) > 0 {
+		subtype := pkt.Data[0]
+		if subtype == icmp.ControlAuthOK || subtype == icmp.ControlAuthFail || subtype == icmp.ControlConnectACK || subtype == icmp.ControlConnectFail {
+			highPriority = true
+		}
+	}
+	priority := highPriority || pkt.Type == icmp.TypeControl
 	payload := pkt.Encode()
 
 	encrypted, err := s.encryptor.Encrypt(payload)
@@ -1119,7 +1177,7 @@ func (s *Server) sendResponse(clientIP, srcIP net.IP, routeFlag uint8, relayIP n
 		}
 
 		// Use queueSend instead of direct socket.SendReply
-		s.queueSend(localIP, destIP, icmpID, icmpSeq, p, true, priority)
+		s.queueSend(localIP, destIP, icmpID, icmpSeq, p, true, priority, highPriority)
 	}
 	return nil
 }
@@ -1164,7 +1222,7 @@ func (s *Server) sendPush(session *icmp.Session, pkt *icmp.TunnelPacket) error {
 		icmpID := session.PushICMPID
 		icmpSeq := session.GetNextICMPSeq()
 		
-		s.queueSend(localIP, destIP, icmpID, icmpSeq, p, false, false)
+		s.queueSend(localIP, destIP, icmpID, icmpSeq, p, false, false, false)
 	}
 	return nil
 }
