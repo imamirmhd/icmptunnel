@@ -5,10 +5,9 @@ VERSION="v1.7.0"
 
 OUTPUT_DIR="bin"
 mkdir -p "$OUTPUT_DIR"
-# rm -f "$OUTPUT_DIR"/* # Don't remove if we want to keep what we have, but better to start clean. Let's keep cleaning.
 rm -f "$OUTPUT_DIR"/*
 
-echo "Building release binaries..."
+echo "Building release binaries for Linux (supported platform)..."
 
 build() {
   local GOOS=$1
@@ -24,22 +23,13 @@ build() {
   fi
 }
 
-# Linux
+# Linux is the primary supported platform for raw socket ICMP tunneling
 build linux amd64 ""
-build linux 386 ""
 build linux arm64 ""
+build linux 386 ""
 build linux arm ""
 build linux mips ""
 build linux mipsle ""
 
-# Darwin (macOS)
-build darwin amd64 ""
-build darwin arm64 ""
-
-# Windows
-build windows amd64 ".exe"
-build windows 386 ".exe"
-
 echo "Build process finished."
 ls -lh "$OUTPUT_DIR"
-
