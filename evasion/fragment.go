@@ -20,9 +20,7 @@ func NewFragmenter(maxFragmentSize int) *Fragmenter {
 	if maxFragmentSize < 32 {
 		maxFragmentSize = 32
 	}
-	return &Fragmenter{
-		maxFragmentSize: maxFragmentSize,
-	}
+	return &Fragmenter{maxFragmentSize: maxFragmentSize}
 }
 
 // Fragment splits data into fragments, each prefixed with a fragment header.
@@ -44,7 +42,6 @@ func (f *Fragmenter) Fragment(data []byte) [][]byte {
 	fragID := f.nextID
 
 	fragments := make([][]byte, 0, totalFragments)
-
 	for i := 0; i < totalFragments; i++ {
 		start := i * maxPayload
 		end := start + maxPayload
@@ -60,61 +57,13 @@ func (f *Fragmenter) Fragment(data []byte) [][]byte {
 		copy(frag[FragmentHeaderSize:], chunk)
 		fragments = append(fragments, frag)
 	}
-
 	return fragments
-}
-
-// Reassemble combines fragments back into the original data.
-// Fragments must all share the same fragment ID.
-func (f *Fragmenter) Reassemble(fragments [][]byte) ([]byte, error) {
-	if len(fragments) == 0 {
-		return nil, fmt.Errorf("no fragments to reassemble")
-	}
-
-	// Parse first fragment to get expected count
-	if len(fragments[0]) < FragmentHeaderSize {
-		return nil, fmt.Errorf("fragment too small")
-	}
-
-	expectedTotal := int(fragments[0][3])
-	if len(fragments) != expectedTotal {
-		return nil, fmt.Errorf("expected %d fragments, got %d", expectedTotal, len(fragments))
-	}
-
-	// Sort by index and concatenate
-	sorted := make([][]byte, expectedTotal)
-	for _, frag := range fragments {
-		if len(frag) < FragmentHeaderSize {
-			return nil, fmt.Errorf("fragment too small")
-		}
-		idx := int(frag[2])
-		if idx >= expectedTotal {
-			return nil, fmt.Errorf("fragment index %d out of range", idx)
-		}
-		sorted[idx] = frag[FragmentHeaderSize:]
-	}
-
-	// Concatenate
-	totalSize := 0
-	for _, piece := range sorted {
-		if piece == nil {
-			return nil, fmt.Errorf("missing fragment")
-		}
-		totalSize += len(piece)
-	}
-
-	result := make([]byte, 0, totalSize)
-	for _, piece := range sorted {
-		result = append(result, piece...)
-	}
-
-	return result, nil
 }
 
 // FragmentBuffer accumulates fragments for reassembly.
 type FragmentBuffer struct {
-	fragments map[uint16]map[int][]byte // fragID -> index -> data
-	expected  map[uint16]int            // fragID -> total expected
+	fragments map[uint16]map[int][]byte
+	expected  map[uint16]int
 }
 
 // NewFragmentBuffer creates a new fragment buffer.
@@ -125,7 +74,7 @@ func NewFragmentBuffer() *FragmentBuffer {
 	}
 }
 
-// Add adds a fragment to the buffer. Returns the reassembled data if all fragments are present.
+// Add adds a fragment to the buffer. Returns reassembled data if all fragments are present.
 func (fb *FragmentBuffer) Add(frag []byte) ([]byte, bool, error) {
 	if len(frag) < FragmentHeaderSize {
 		return nil, false, fmt.Errorf("fragment too small")
@@ -145,7 +94,6 @@ func (fb *FragmentBuffer) Add(frag []byte) ([]byte, bool, error) {
 	fb.fragments[fragID][idx] = payload
 
 	if len(fb.fragments[fragID]) == fb.expected[fragID] {
-		// All fragments received, reassemble
 		totalSize := 0
 		for _, p := range fb.fragments[fragID] {
 			totalSize += len(p)
@@ -160,4 +108,46 @@ func (fb *FragmentBuffer) Add(frag []byte) ([]byte, bool, error) {
 	}
 
 	return nil, false, nil
+}
+
+// Reassemble combines pre-sorted fragments.
+func (f *Fragmenter) Reassemble(fragments [][]byte) ([]byte, error) {
+	if len(fragments) == 0 {
+		return nil, fmt.Errorf("no fragments to reassemble")
+	}
+
+	if len(fragments[0]) < FragmentHeaderSize {
+		return nil, fmt.Errorf("fragment too small")
+	}
+
+	expectedTotal := int(fragments[0][3])
+	if len(fragments) != expectedTotal {
+		return nil, fmt.Errorf("expected %d fragments, got %d", expectedTotal, len(fragments))
+	}
+
+	sorted := make([][]byte, expectedTotal)
+	for _, frag := range fragments {
+		if len(frag) < FragmentHeaderSize {
+			return nil, fmt.Errorf("fragment too small")
+		}
+		idx := int(frag[2])
+		if idx >= expectedTotal {
+			return nil, fmt.Errorf("fragment index %d out of range", idx)
+		}
+		sorted[idx] = frag[FragmentHeaderSize:]
+	}
+
+	totalSize := 0
+	for _, piece := range sorted {
+		if piece == nil {
+			return nil, fmt.Errorf("missing fragment")
+		}
+		totalSize += len(piece)
+	}
+
+	result := make([]byte, 0, totalSize)
+	for _, piece := range sorted {
+		result = append(result, piece...)
+	}
+	return result, nil
 }

@@ -1,162 +1,198 @@
-// Package evasion provides DPI evasion and firewall bypass techniques.
+// Package evasion provides DPI evasion and traffic obfuscation techniques.
 package evasion
 
 import (
 	"time"
 
-	"github.com/user/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/config"
 )
 
-// Manager coordinates all evasion techniques for packet processing.
+// Manager orchestrates all evasion techniques.
 type Manager struct {
-	fragmenter   *Fragmenter
-	padder       *Padder
-	jitter       *Jitter
-	mimicker     *Mimicker
-	checksumMod  *ChecksumManipulator
+	fragmenter    *Fragmenter
+	padder        *Padder
+	jitter        *Jitter
+	mimicker      *Mimicker
 	adaptiveSizer *AdaptiveSizer
+	checksumManip *ChecksumManipulator
+	shaper        *TrafficShaper
+	enabled       bool
+	cfg           config.EvasionConfig
 }
 
-// NewManager creates an evasion manager with the given configuration.
+// NewManager creates a new evasion manager.
 func NewManager(cfg config.EvasionConfig) *Manager {
-	m := &Manager{}
-
-	if cfg.Fragmentation.Enabled {
-		m.fragmenter = NewFragmenter(cfg.Fragmentation.MaxFragmentSize)
+	m := &Manager{
+		enabled: cfg.Enabled,
+		cfg:     cfg,
 	}
 
-	if cfg.Padding.Enabled {
-		m.padder = NewPadder(cfg.Padding.MinSize, cfg.Padding.MaxSize)
+	if !cfg.Enabled {
+		return m
 	}
 
-	if cfg.Jitter.Enabled {
-		minDelay, _ := time.ParseDuration(cfg.Jitter.MinDelay)
-		maxDelay, _ := time.ParseDuration(cfg.Jitter.MaxDelay)
+	if cfg.Fragment {
+		fragSize := cfg.FragmentSize
+		if fragSize == 0 {
+			fragSize = 256
+		}
+		m.fragmenter = NewFragmenter(fragSize)
+	}
+
+	if cfg.Padding {
+		m.padder = NewPadder(cfg.PaddingMin, cfg.PaddingMax)
+	}
+
+	if cfg.Jitter {
+		minDelay, _ := time.ParseDuration(cfg.JitterMin)
+		maxDelay, _ := time.ParseDuration(cfg.JitterMax)
 		if minDelay == 0 {
-			minDelay = 10 * time.Millisecond
+			minDelay = 1 * time.Millisecond
 		}
 		if maxDelay == 0 {
-			maxDelay = 100 * time.Millisecond
+			maxDelay = 10 * time.Millisecond
 		}
 		m.jitter = NewJitter(minDelay, maxDelay)
 	}
 
-	if cfg.Mimicry.Enabled {
-		m.mimicker = NewMimicker(cfg.Mimicry.OSSignature)
+	if cfg.Mimicry != "" {
+		m.mimicker = NewMimicker(cfg.Mimicry)
 	}
 
-	if cfg.Checksum.Enabled {
-		m.checksumMod = NewChecksumManipulator()
+	if cfg.AdaptiveSize {
+		m.adaptiveSizer = NewAdaptiveSizer(cfg.AdaptiveMin, cfg.AdaptiveMax, cfg.AdaptiveStep)
 	}
 
-	if cfg.AdaptiveSize.Enabled {
-		m.adaptiveSizer = NewAdaptiveSizer(cfg.AdaptiveSize.MinSize, cfg.AdaptiveSize.MaxSize, cfg.AdaptiveSize.StepSize)
+	if cfg.ChecksumRotate {
+		m.checksumManip = NewChecksumManipulator()
+	}
+
+	if cfg.TrafficShaping {
+		burstMin := cfg.BurstMin
+		burstMax := cfg.BurstMax
+		if burstMin == 0 {
+			burstMin = 1
+		}
+		if burstMax == 0 {
+			burstMax = 8
+		}
+		m.shaper = NewTrafficShaper(burstMin, burstMax)
 	}
 
 	return m
 }
 
-// Apply processes an outgoing packet through all enabled evasion techniques.
-// Returns one or more packets (fragmentation may split into multiple).
-func (m *Manager) Apply(packet []byte) ([][]byte, error) {
-	data := packet
+// ApplyOutbound applies all enabled evasion techniques to outbound data.
+func (m *Manager) ApplyOutbound(data []byte) []byte {
+	if !m.enabled || len(data) == 0 {
+		return data
+	}
 
-	// Step 1: Padding
+	result := data
+
 	if m.padder != nil {
-		data = m.padder.Pad(data)
+		result = m.padder.Pad(result)
 	}
 
-	// Step 2: Adaptive sizing
 	if m.adaptiveSizer != nil {
-		data = m.adaptiveSizer.Resize(data)
+		result = m.adaptiveSizer.Resize(result)
 	}
 
-	// Step 3: Fragmentation
-	var packets [][]byte
-	if m.fragmenter != nil {
-		frags := m.fragmenter.Fragment(data)
-		packets = frags
-	} else {
-		packets = [][]byte{data}
-	}
-
-	return packets, nil
+	return result
 }
 
-// Unapply reverses evasion techniques on received packets.
-// Handles defragmentation and padding removal.
-func (m *Manager) Unapply(packets [][]byte) ([]byte, error) {
-	var data []byte
-
-	// Step 1: Defragment if needed
-	if m.fragmenter != nil && len(packets) > 1 {
-		var err error
-		data, err = m.fragmenter.Reassemble(packets)
-		if err != nil {
-			return nil, err
-		}
-	} else if len(packets) > 0 {
-		data = packets[0]
+// RemoveInbound reverses all evasion techniques from inbound data.
+func (m *Manager) RemoveInbound(data []byte) ([]byte, error) {
+	if !m.enabled || len(data) == 0 {
+		return data, nil
 	}
 
-	// Step 2: Remove adaptive sizing padding
+	result := data
+
 	if m.adaptiveSizer != nil {
-		data = m.adaptiveSizer.Unresize(data)
+		result = m.adaptiveSizer.Unresize(result)
 	}
 
-	// Step 3: Remove padding
 	if m.padder != nil {
 		var err error
-		data, err = m.padder.Unpad(data)
+		result, err = m.padder.Unpad(result)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return data, nil
+	return result, nil
 }
 
-// PreSendDelay returns the jitter delay to apply before sending.
-func (m *Manager) PreSendDelay() time.Duration {
-	if m.jitter != nil {
-		return m.jitter.Delay()
+// Fragment splits data into fragments if fragmentation is enabled.
+func (m *Manager) Fragment(data []byte) [][]byte {
+	if !m.enabled || m.fragmenter == nil {
+		return [][]byte{data}
 	}
-	return 0
+	return m.fragmenter.Fragment(data)
 }
 
-// GetMimicryConfig returns the mimicry settings if enabled.
-func (m *Manager) GetMimicryConfig() *MimicrySettings {
+// Fragmenter returns the fragmenter, if any.
+func (m *Manager) Fragmenter() *Fragmenter {
+	return m.fragmenter
+}
+
+// FragmentBuffer returns a new fragment buffer for reassembly.
+func (m *Manager) NewFragmentBuffer() *FragmentBuffer {
+	return NewFragmentBuffer()
+}
+
+// ApplyJitter applies timing jitter if enabled.
+func (m *Manager) ApplyJitter() {
+	if m.enabled && m.jitter != nil {
+		m.jitter.Sleep()
+	}
+}
+
+// GetMimicrySettings returns the mimicry settings, if any.
+func (m *Manager) GetMimicrySettings() *MimicrySettings {
 	if m.mimicker != nil {
 		return m.mimicker.Settings()
 	}
 	return nil
 }
 
-// ShouldManipulateChecksum returns true if checksum manipulation is enabled.
-func (m *Manager) ShouldManipulateChecksum() bool {
-	return m.checksumMod != nil
+// ApplyMimicry applies mimicry to ICMP headers.
+func (m *Manager) ApplyMimicry(icmpPacket []byte, seqCounter uint16) {
+	if m.enabled && m.mimicker != nil {
+		m.mimicker.ApplyToHeaders(icmpPacket, seqCounter)
+	}
 }
 
-// ManipulateChecksum applies checksum manipulation to the ICMP packet.
+// ManipulateChecksum applies checksum manipulation.
 func (m *Manager) ManipulateChecksum(icmpPacket []byte) []byte {
-	if m.checksumMod != nil {
-		return m.checksumMod.Manipulate(icmpPacket)
+	if m.enabled && m.checksumManip != nil {
+		return m.checksumManip.Manipulate(icmpPacket)
 	}
 	return icmpPacket
 }
 
-// Overhead returns the maximum additional bytes added by enabled evasion techniques.
-func (m *Manager) Overhead() int {
-	overhead := 0
-	if m.padder != nil {
-		overhead += m.padder.maxSize + 1
+// ShouldSendNow checks if the traffic shaper allows sending.
+func (m *Manager) ShouldSendNow() bool {
+	if !m.enabled || m.shaper == nil {
+		return true
 	}
-	if m.adaptiveSizer != nil {
-		// Adaptive sizer pads to its own maxSize, but also adds a 2-byte header.
-		// However, it usually encapsulates the whole thing.
-		// For safety, let's say it adds at least its header.
-		overhead += 2
+	return m.shaper.ShouldSend()
+}
+
+// WaitForBurst blocks until the shaper allows a burst.
+func (m *Manager) WaitForBurst() {
+	if m.enabled && m.shaper != nil {
+		m.shaper.WaitForBurst()
 	}
-	// Mimicry/Jitter/Checksum don't add size to the payload.
-	return overhead
+}
+
+// IsEnabled returns whether evasion is enabled.
+func (m *Manager) IsEnabled() bool {
+	return m.enabled
+}
+
+// IsFragmentEnabled returns whether fragmentation is enabled.
+func (m *Manager) IsFragmentEnabled() bool {
+	return m.enabled && m.fragmenter != nil
 }

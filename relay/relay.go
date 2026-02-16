@@ -1,81 +1,100 @@
-// Package relay implements a lightweight ICMP relay server for spoofed traffic.
+// Package relay implements a lightweight ICMP relay server for spoofing.
 package relay
 
 import (
+	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/user/icmptunnel/config"
-	"github.com/user/icmptunnel/icmp"
-	"github.com/user/icmptunnel/logger"
+	"github.com/imamirmhd/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/icmp"
+	"github.com/imamirmhd/icmptunnel/logger"
 )
 
-// Server is a lightweight relay that forwards ICMP packets.
-// In spoofing mode, the client sends ICMP echo requests to the relay with a
-// forged source IP (the main server's IP). The kernel or the relay echoes
-// back to the forged source, which is the main server. The main server
-// processes the packet and finds the real client IP embedded in the payload.
+// Server relays ICMP packets between clients and tunnel servers.
 type Server struct {
-	cfg       *config.RelayServerConfig
-	socket    *icmp.Socket
-	log       *logger.Logger
-	rateLimit *rateLimiter
-	done      chan struct{}
-	wg        sync.WaitGroup
+	cfg     *config.RelayServerConfig
+	socket  *icmp.Socket
+	log     *logger.Logger
+
+	// Rate limiting per source
+	rates   map[string]*rateLimiter
+	ratesMu sync.Mutex
+	maxPPS  int
+
+	// Allowed sources
+	allowed map[string]bool
+
+	done chan struct{}
+	wg   sync.WaitGroup
+
+	// Stats
+	statsRelayed uint64
+	statsDropped uint64
+}
+
+type rateLimiter struct {
+	count    int64
+	lastReset time.Time
 }
 
 // NewServer creates a new relay server.
 func NewServer(cfg *config.RelayServerConfig) (*Server, error) {
 	log := logger.Init(cfg.Logging.Level, cfg.Logging.Output).WithComponent("relay")
 
-	sock, err := icmp.NewSocket(1472, 64, 5*time.Second, 5*time.Second)
+	sock, err := icmp.NewSocket(1472, 16, 5*time.Second, 5*time.Second)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("creating socket: %w", err)
 	}
 
 	if err := sock.Bind(cfg.Listen); err != nil {
 		sock.Close()
-		return nil, err
+		return nil, fmt.Errorf("binding: %w", err)
 	}
 
-	rl := newRateLimiter(cfg.RateLimit)
+	allowed := make(map[string]bool)
+	for _, src := range cfg.AllowedSources {
+		allowed[src] = true
+	}
 
 	return &Server{
-		cfg:       cfg,
-		socket:    sock,
-		log:       log,
-		rateLimit: rl,
-		done:      make(chan struct{}),
+		cfg:     cfg,
+		socket:  sock,
+		log:     log,
+		rates:   make(map[string]*rateLimiter),
+		maxPPS:  cfg.RateLimit,
+		allowed: allowed,
+		done:    make(chan struct{}),
 	}, nil
 }
 
-// Start begins the relay server.
+// Start begins relaying packets.
 func (s *Server) Start() error {
-	s.log.Info("Starting ICMP relay server on %s (rate limit: %d pps)", s.cfg.Listen, s.cfg.RateLimit)
+	s.log.Info("Relay server started on %s (rate limit: %d pps)", s.cfg.Listen, s.maxPPS)
 
 	s.wg.Add(1)
-	go s.receiveLoop()
+	go s.relayLoop()
+
+	s.wg.Add(1)
+	go s.statsLoop()
 
 	return nil
 }
 
 // Stop shuts down the relay server.
 func (s *Server) Stop() {
-	s.log.Info("Stopping relay server")
 	close(s.done)
 	s.socket.Close()
 	s.wg.Wait()
+	s.log.Info("Relay server stopped")
 }
 
-// Wait blocks until the server is stopped.
-func (s *Server) Wait() {
-	c := make(chan struct{})
-	<-c
-}
-
-func (s *Server) receiveLoop() {
+func (s *Server) relayLoop() {
 	defer s.wg.Done()
+
+	s.socket.SetReadDeadline(200 * time.Millisecond)
 
 	for {
 		select {
@@ -84,100 +103,100 @@ func (s *Server) receiveLoop() {
 		default:
 		}
 
-		srcIP, icmpType, id, seq, payload, origBuf, err := s.socket.Receive()
+		srcIP, _, _, _, payload, rawBuf, err := s.socket.Receive()
 		if err != nil {
-			if origBuf != nil {
-				icmp.ReleaseBuffer(origBuf)
+			if rawBuf != nil {
+				icmp.ReleaseBuffer(rawBuf)
 			}
 			continue
 		}
-		defer icmp.ReleaseBuffer(origBuf)
 
-		// Only process echo requests
-		if icmpType != 8 {
+		srcStr := srcIP.String()
+
+		// Check allowed sources (if configured)
+		if len(s.allowed) > 0 && !s.allowed[srcStr] {
+			icmp.ReleaseBuffer(rawBuf)
+			atomic.AddUint64(&s.statsDropped, 1)
 			continue
 		}
 
 		// Rate limiting
-		if !s.rateLimit.allow(srcIP.String()) {
+		if !s.checkRate(srcStr) {
+			icmp.ReleaseBuffer(rawBuf)
+			atomic.AddUint64(&s.statsDropped, 1)
 			continue
 		}
 
-		// Check source whitelist
-		if len(s.cfg.AllowedSources) > 0 && !s.isAllowed(srcIP) {
-			s.log.Debug("Blocked packet from non-whitelisted source: %s", srcIP)
+		// Extract spoof header to find real destination
+		if len(payload) < icmp.SpoofHeaderSize {
+			icmp.ReleaseBuffer(rawBuf)
 			continue
 		}
 
-		s.log.Debug("Relaying ICMP from %s (%d bytes)", srcIP, len(payload))
+		spoofHdr, _, err := icmp.ExtractSpoofHeader(payload)
+		if err != nil {
+			icmp.ReleaseBuffer(rawBuf)
+			continue
+		}
 
-		// The relay simply echoes back. Since the source IP is spoofed
-		// (set to the main server's IP by the client), the echo reply
-		// will be sent to the main server by the kernel.
-		// We explicitly send an echo reply for better control.
+		// Forward the entire packet (including spoof header) to the tunnel server
+		dstIP := spoofHdr.RelayIP
+		if dstIP == nil {
+			icmp.ReleaseBuffer(rawBuf)
+			continue
+		}
+
 		localIP := getLocalIP()
-		if err := s.socket.SendReply(localIP, srcIP, id, seq, payload); err != nil {
-			s.log.Error("Failed to relay: %v", err)
+		if sendErr := s.socket.Send(localIP, dstIP, 0, 0, payload); sendErr != nil {
+			s.log.Debug("Relay forward failed: %v", sendErr)
+		} else {
+			atomic.AddUint64(&s.statsRelayed, 1)
+		}
+
+		icmp.ReleaseBuffer(rawBuf)
+	}
+}
+
+func (s *Server) checkRate(src string) bool {
+	s.ratesMu.Lock()
+	defer s.ratesMu.Unlock()
+
+	rl, ok := s.rates[src]
+	if !ok {
+		s.rates[src] = &rateLimiter{count: 1, lastReset: time.Now()}
+		return true
+	}
+
+	if time.Since(rl.lastReset) > time.Second {
+		rl.count = 1
+		rl.lastReset = time.Now()
+		return true
+	}
+
+	if rl.count >= int64(s.maxPPS) {
+		return false
+	}
+
+	rl.count++
+	return true
+}
+
+func (s *Server) statsLoop() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			relayed := atomic.LoadUint64(&s.statsRelayed)
+			dropped := atomic.LoadUint64(&s.statsDropped)
+			s.log.Info("[RELAY STATS] relayed=%d dropped=%d", relayed, dropped)
 		}
 	}
-}
-
-func (s *Server) isAllowed(ip net.IP) bool {
-	for _, allowed := range s.cfg.AllowedSources {
-		if _, network, err := net.ParseCIDR(allowed); err == nil {
-			if network.Contains(ip) {
-				return true
-			}
-		} else if ip.String() == allowed {
-			return true
-		}
-	}
-	return false
-}
-
-// rateLimiter implements a simple per-source rate limiter.
-type rateLimiter struct {
-	limit   int
-	counts  map[string]*tokenBucket
-	mu      sync.Mutex
-}
-
-type tokenBucket struct {
-	tokens    int
-	lastReset time.Time
-}
-
-func newRateLimiter(limit int) *rateLimiter {
-	return &rateLimiter{
-		limit:  limit,
-		counts: make(map[string]*tokenBucket),
-	}
-}
-
-func (r *rateLimiter) allow(source string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	now := time.Now()
-	bucket, exists := r.counts[source]
-	if !exists {
-		r.counts[source] = &tokenBucket{tokens: r.limit - 1, lastReset: now}
-		return true
-	}
-
-	// Reset every second
-	if now.Sub(bucket.lastReset) > time.Second {
-		bucket.tokens = r.limit - 1
-		bucket.lastReset = now
-		return true
-	}
-
-	if bucket.tokens > 0 {
-		bucket.tokens--
-		return true
-	}
-
-	return false
 }
 
 func getLocalIP() net.IP {

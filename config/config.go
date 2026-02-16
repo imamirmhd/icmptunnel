@@ -3,282 +3,287 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
 
-// ServerConfig holds all server-side configuration.
+// ServerConfig holds all configuration for the tunnel server.
 type ServerConfig struct {
-	Listen     string           `toml:"listen"`
-	AuthTokens []string         `toml:"auth_tokens"`
-	ICMP       ICMPConfig       `toml:"icmp"`
+	Listen     string          `toml:"listen"`
+	AuthTokens []string        `toml:"auth_tokens"`
+	Logging    LoggingConfig   `toml:"logging"`
+	ICMP       ICMPConfig      `toml:"icmp"`
+	Transport  TransportConfig `toml:"transport"`
 	Encryption EncryptionConfig `toml:"encryption"`
-	Evasion    EvasionConfig    `toml:"evasion"`
-	Firewall   FirewallConfig   `toml:"firewall"`
-	Logging    LoggingConfig    `toml:"logging"`
-	Relay      RelayConfig      `toml:"relay"`
-	Transport  TransportConfig  `toml:"transport"`
+	Evasion    EvasionConfig   `toml:"evasion"`
+	Limits     LimitsConfig    `toml:"limits"`
 }
 
-// ClientConfig holds all client-side configuration.
+// ClientConfig holds all configuration for the tunnel client.
 type ClientConfig struct {
 	ServerAddr string           `toml:"server_addr"`
-	BindAddr   string           `toml:"bind_addr"`
 	AuthToken  string           `toml:"auth_token"`
+	Logging    LoggingConfig    `toml:"logging"`
 	ICMP       ICMPConfig       `toml:"icmp"`
+	Transport  TransportConfig  `toml:"transport"`
 	Encryption EncryptionConfig `toml:"encryption"`
 	Evasion    EvasionConfig    `toml:"evasion"`
 	Socks5     []Socks5Config   `toml:"socks5"`
-	Forwards   []ForwardConfig  `toml:"forwards"`
-	Logging    LoggingConfig    `toml:"logging"`
+	Forwards   []ForwardConfig  `toml:"forward"`
 	Spoof      SpoofConfig      `toml:"spoof"`
-	Transport  TransportConfig  `toml:"transport"`
+	Recovery   RecoveryConfig   `toml:"recovery"`
 }
 
-// RelayServerConfig holds relay server configuration.
+// RelayServerConfig holds configuration for the relay server.
 type RelayServerConfig struct {
-	Listen       string        `toml:"listen"`
-	AllowedSources []string    `toml:"allowed_sources"`
-	RateLimit    int           `toml:"rate_limit"`
-	Logging      LoggingConfig `toml:"logging"`
+	Listen         string        `toml:"listen"`
+	AllowedSources []string      `toml:"allowed_sources"`
+	RateLimit      int           `toml:"rate_limit"`
+	Logging        LoggingConfig `toml:"logging"`
 }
 
-// ICMPConfig holds ICMP-specific settings.
+type LoggingConfig struct {
+	Level  string `toml:"level"`
+	Output string `toml:"output"`
+}
+
 type ICMPConfig struct {
 	MaxPacketSize int    `toml:"max_packet_size"`
-	TTL           int    `toml:"ttl"`
+	SocketBufMB   int    `toml:"socket_buf_mb"`
 	ReadTimeout   string `toml:"read_timeout"`
 	WriteTimeout  string `toml:"write_timeout"`
-	SequenceStart int    `toml:"sequence_start"`
-	IDRange       [2]int `toml:"id_range"`
 }
 
-// TransportConfig holds transport layer settings.
 type TransportConfig struct {
-	WindowSize            int    `toml:"window_size"`
-	MaxPayload            int    `toml:"max_payload"`
-	RetransmissionTimeout string `toml:"retransmission_timeout"`
-	Compression           bool   `toml:"compression"`
-	StreamCount           int    `toml:"stream_count"`
-	PacingAggressiveness  int    `toml:"pacing_aggressiveness"`
-	MaxStreams            int    `toml:"max_streams"`
+	WindowSize         int    `toml:"window_size"`
+	MaxStreams          int    `toml:"max_streams"`
+	RetransmitTimeout  string `toml:"retransmit_timeout"`
+	HeartbeatInterval  string `toml:"heartbeat_interval"`
+	SessionTimeout     string `toml:"session_timeout"`
+	Compression        string `toml:"compression"` // "lz4", "zlib", "none"
+	SenderWorkers      int    `toml:"sender_workers"`
+	AggregationDelay   string `toml:"aggregation_delay"`
+	DownlinkReadDeadline string `toml:"downlink_read_deadline"`
+	EnableCRC          bool   `toml:"enable_crc"`
 }
 
-// EncryptionConfig holds encryption settings.
 type EncryptionConfig struct {
 	Enabled bool   `toml:"enabled"`
 	Method  string `toml:"method"`
 	Key     string `toml:"key"`
 }
 
-// EvasionConfig holds all DPI evasion technique settings.
 type EvasionConfig struct {
-	Fragmentation FragmentConfig     `toml:"fragmentation"`
-	Padding       PaddingConfig      `toml:"padding"`
-	Jitter        JitterConfig       `toml:"jitter"`
-	Mimicry       MimicryConfig      `toml:"mimicry"`
-	Checksum      ChecksumConfig     `toml:"checksum"`
-	AdaptiveSize  AdaptiveSizeConfig `toml:"adaptive_size"`
+	Enabled         bool   `toml:"enabled"`
+	Fragment        bool   `toml:"fragment"`
+	FragmentSize    int    `toml:"fragment_size"`
+	Padding         bool   `toml:"padding"`
+	PaddingMin      int    `toml:"padding_min"`
+	PaddingMax      int    `toml:"padding_max"`
+	Jitter          bool   `toml:"jitter"`
+	JitterMin       string `toml:"jitter_min"`
+	JitterMax       string `toml:"jitter_max"`
+	Mimicry         string `toml:"mimicry"` // "linux", "windows", "macos"
+	AdaptiveSize    bool   `toml:"adaptive_size"`
+	AdaptiveMin     int    `toml:"adaptive_min"`
+	AdaptiveMax     int    `toml:"adaptive_max"`
+	AdaptiveStep    int    `toml:"adaptive_step"`
+	ChecksumRotate  bool   `toml:"checksum_rotate"`
+	TrafficShaping  bool   `toml:"traffic_shaping"`
+	BurstMin        int    `toml:"burst_min"`
+	BurstMax        int    `toml:"burst_max"`
 }
 
-// FragmentConfig controls packet fragmentation.
-type FragmentConfig struct {
-	Enabled         bool `toml:"enabled"`
-	MaxFragmentSize int  `toml:"max_fragment_size"`
-}
-
-// PaddingConfig controls payload randomization/padding.
-type PaddingConfig struct {
-	Enabled bool `toml:"enabled"`
-	MinSize int  `toml:"min_size"`
-	MaxSize int  `toml:"max_size"`
-}
-
-// JitterConfig controls timing jitter between packets.
-type JitterConfig struct {
-	Enabled  bool   `toml:"enabled"`
-	MinDelay string `toml:"min_delay"`
-	MaxDelay string `toml:"max_delay"`
-}
-
-// MimicryConfig controls protocol mimicry behavior.
-type MimicryConfig struct {
-	Enabled     bool   `toml:"enabled"`
-	OSSignature string `toml:"os_signature"`
-}
-
-// ChecksumConfig controls checksum manipulation.
-type ChecksumConfig struct {
-	Enabled bool `toml:"enabled"`
-}
-
-// AdaptiveSizeConfig controls adaptive packet sizing.
-type AdaptiveSizeConfig struct {
-	Enabled  bool `toml:"enabled"`
-	MinSize  int  `toml:"min_size"`
-	MaxSize  int  `toml:"max_size"`
-	StepSize int  `toml:"step_size"`
-}
-
-// Socks5Config holds SOCKS5 proxy listener settings.
 type Socks5Config struct {
 	Listen   string `toml:"listen"`
 	Username string `toml:"username"`
 	Password string `toml:"password"`
 }
 
-// ForwardConfig holds a single port-forwarding rule.
 type ForwardConfig struct {
 	Listen      string `toml:"listen"`
 	Destination string `toml:"destination"`
-	Protocol    string `toml:"protocol"`
+	Protocol    string `toml:"protocol"` // "tcp" or "udp"
 }
 
-// FirewallConfig holds firewall-related settings.
-type FirewallConfig struct {
-	DisableEchoReply bool `toml:"disable_echo_reply"`
-	EnableForwarding bool `toml:"enable_forwarding"`
-}
-
-// LoggingConfig holds logging settings.
-type LoggingConfig struct {
-	Level  string `toml:"level"`
-	Output string `toml:"output"`
-}
-
-// RelayConfig holds relay/spoofing settings on the server side.
-type RelayConfig struct {
-	Enabled bool `toml:"enabled"`
-}
-
-// SpoofConfig holds ICMP spoofing settings on the client side.
 type SpoofConfig struct {
-	Enabled       bool   `toml:"enabled"`
-	RelayAddr     string `toml:"relay_addr"`
-	RouteViaRelay bool   `toml:"route_via_relay"`
+	Enabled   bool   `toml:"enabled"`
+	RelayAddr string `toml:"relay_addr"`
+	SourceIP  string `toml:"source_ip"`
+}
+
+type LimitsConfig struct {
+	MaxSessions       int `toml:"max_sessions"`
+	MaxStreamsPerSession int `toml:"max_streams_per_session"`
+	MaxPPS            int `toml:"max_pps"`
+}
+
+type RecoveryConfig struct {
+	Enabled           bool   `toml:"enabled"`
+	MaxReconnects     int    `toml:"max_reconnects"`
+	ReconnectDelay    string `toml:"reconnect_delay"`
+	MaxReconnectDelay string `toml:"max_reconnect_delay"`
+	BufferReplay      bool   `toml:"buffer_replay"`
+	ReplayBufferSize  int    `toml:"replay_buffer_size"`
 }
 
 // LoadServerConfig loads server configuration from a TOML file.
 func LoadServerConfig(path string) (*ServerConfig, error) {
-	cfg := &ServerConfig{
-		Listen:   "0.0.0.0",
-		ICMP:     DefaultICMPConfig(),
-		Encryption: DefaultEncryptionConfig(),
-		Evasion:  DefaultEvasionConfig(),
-		Firewall: DefaultFirewallConfig(),
-		Logging:  DefaultLoggingConfig(),
-		Transport: DefaultTransportConfig(),
-	}
-
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading config file: %w", err)
 	}
 
+	cfg := &ServerConfig{}
 	if err := toml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("parsing config file: %w", err)
+		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 
-	if err := validateServerConfig(cfg); err != nil {
-		return nil, fmt.Errorf("validating config: %w", err)
-	}
-
+	applyServerDefaults(cfg)
 	return cfg, nil
 }
 
 // LoadClientConfig loads client configuration from a TOML file.
 func LoadClientConfig(path string) (*ClientConfig, error) {
-	cfg := &ClientConfig{
-		ICMP:       DefaultICMPConfig(),
-		Encryption: DefaultEncryptionConfig(),
-		Evasion:    DefaultEvasionConfig(),
-		Logging:    DefaultLoggingConfig(),
-		Transport:  DefaultTransportConfig(),
-	}
-
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading config file: %w", err)
 	}
 
+	cfg := &ClientConfig{}
 	if err := toml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("parsing config file: %w", err)
+		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 
-	if err := validateClientConfig(cfg); err != nil {
-		return nil, fmt.Errorf("validating config: %w", err)
-	}
-
+	applyClientDefaults(cfg)
 	return cfg, nil
 }
 
 // LoadRelayConfig loads relay server configuration from a TOML file.
 func LoadRelayConfig(path string) (*RelayServerConfig, error) {
-	cfg := &RelayServerConfig{
-		Listen:    "0.0.0.0",
-		RateLimit: 1000,
-		Logging:   DefaultLoggingConfig(),
-	}
-
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading config file: %w", err)
 	}
 
+	cfg := &RelayServerConfig{}
 	if err := toml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("parsing config file: %w", err)
+		return nil, fmt.Errorf("parsing config: %w", err)
+	}
+
+	if cfg.Listen == "" {
+		cfg.Listen = "0.0.0.0"
+	}
+	if cfg.RateLimit == 0 {
+		cfg.RateLimit = 10000
+	}
+	if cfg.Logging.Level == "" {
+		cfg.Logging.Level = "info"
+	}
+	if cfg.Logging.Output == "" {
+		cfg.Logging.Output = "stdout"
 	}
 
 	return cfg, nil
 }
 
-func validateServerConfig(cfg *ServerConfig) error {
-	if len(cfg.AuthTokens) == 0 {
-		return fmt.Errorf("at least one auth_token must be configured")
+func applyServerDefaults(cfg *ServerConfig) {
+	if cfg.Listen == "" {
+		cfg.Listen = "0.0.0.0"
 	}
-	if cfg.ICMP.MaxPacketSize < 64 || cfg.ICMP.MaxPacketSize > 65535 {
-		return fmt.Errorf("icmp.max_packet_size must be between 64 and 65535")
+	applyICMPDefaults(&cfg.ICMP)
+	applyTransportDefaults(&cfg.Transport)
+	if cfg.Logging.Level == "" {
+		cfg.Logging.Level = "info"
 	}
-	if cfg.Encryption.Enabled && cfg.Encryption.Key == "" {
-		return fmt.Errorf("encryption.key must be set when encryption is enabled")
+	if cfg.Logging.Output == "" {
+		cfg.Logging.Output = "stdout"
 	}
-	return nil
-}
-
-func validateClientConfig(cfg *ClientConfig) error {
-	if cfg.ServerAddr == "" && !cfg.Spoof.Enabled {
-		return fmt.Errorf("server_addr must be set")
+	if cfg.Limits.MaxSessions == 0 {
+		cfg.Limits.MaxSessions = 10000
 	}
-	if cfg.AuthToken == "" {
-		return fmt.Errorf("auth_token must be set")
+	if cfg.Limits.MaxStreamsPerSession == 0 {
+		cfg.Limits.MaxStreamsPerSession = 4096
 	}
-	if len(cfg.Socks5) == 0 && len(cfg.Forwards) == 0 {
-		return fmt.Errorf("at least one socks5 or forward rule must be configured")
-	}
-	if cfg.Encryption.Enabled && cfg.Encryption.Key == "" {
-		return fmt.Errorf("encryption.key must be set when encryption is enabled")
-	}
-	if cfg.Spoof.Enabled && cfg.Spoof.RelayAddr == "" {
-		return fmt.Errorf("spoof.relay_addr must be set when spoofing is enabled")
-	}
-	for i, f := range cfg.Forwards {
-		if f.Protocol != "tcp" && f.Protocol != "udp" {
-			return fmt.Errorf("forwards[%d].protocol must be 'tcp' or 'udp'", i)
-		}
-	}
-	return nil
-}
-
-// DefaultTransportConfig returns default transport settings.
-func DefaultTransportConfig() TransportConfig {
-	return TransportConfig{
-		WindowSize:            100,
-		MaxPayload:            1400,
-		RetransmissionTimeout: "200ms",
-		Compression:           true,
-		StreamCount:           4,
-		PacingAggressiveness:  5,
-		MaxStreams:            1024,
+	if cfg.Limits.MaxPPS == 0 {
+		cfg.Limits.MaxPPS = 100000
 	}
 }
 
+func applyClientDefaults(cfg *ClientConfig) {
+	applyICMPDefaults(&cfg.ICMP)
+	applyTransportDefaults(&cfg.Transport)
+	if cfg.Logging.Level == "" {
+		cfg.Logging.Level = "info"
+	}
+	if cfg.Logging.Output == "" {
+		cfg.Logging.Output = "stdout"
+	}
+	if cfg.Recovery.MaxReconnects == 0 {
+		cfg.Recovery.MaxReconnects = 100
+	}
+	if cfg.Recovery.ReconnectDelay == "" {
+		cfg.Recovery.ReconnectDelay = "100ms"
+	}
+	if cfg.Recovery.MaxReconnectDelay == "" {
+		cfg.Recovery.MaxReconnectDelay = "30s"
+	}
+	if cfg.Recovery.ReplayBufferSize == 0 {
+		cfg.Recovery.ReplayBufferSize = 65536
+	}
+}
+
+func applyICMPDefaults(cfg *ICMPConfig) {
+	if cfg.MaxPacketSize == 0 {
+		cfg.MaxPacketSize = DefaultMaxPacketSize
+	}
+	if cfg.SocketBufMB == 0 {
+		cfg.SocketBufMB = DefaultSocketBufMB
+	}
+	if cfg.ReadTimeout == "" {
+		cfg.ReadTimeout = DefaultReadTimeout
+	}
+	if cfg.WriteTimeout == "" {
+		cfg.WriteTimeout = DefaultWriteTimeout
+	}
+}
+
+func applyTransportDefaults(cfg *TransportConfig) {
+	if cfg.WindowSize == 0 {
+		cfg.WindowSize = DefaultWindowSize
+	}
+	if cfg.MaxStreams == 0 {
+		cfg.MaxStreams = DefaultMaxStreams
+	}
+	if cfg.RetransmitTimeout == "" {
+		cfg.RetransmitTimeout = DefaultRetransmitTimeout
+	}
+	if cfg.HeartbeatInterval == "" {
+		cfg.HeartbeatInterval = DefaultHeartbeatInterval
+	}
+	if cfg.SessionTimeout == "" {
+		cfg.SessionTimeout = DefaultSessionTimeout
+	}
+	if cfg.Compression == "" {
+		cfg.Compression = DefaultCompression
+	}
+	if cfg.SenderWorkers == 0 {
+		cfg.SenderWorkers = DefaultSenderWorkers
+	}
+	if cfg.AggregationDelay == "" {
+		cfg.AggregationDelay = DefaultAggregationDelay
+	}
+	if cfg.DownlinkReadDeadline == "" {
+		cfg.DownlinkReadDeadline = DefaultDownlinkReadDeadline
+	}
+}
+
+// ParseDuration parses a duration string with fallback.
+func ParseDuration(s string, fallback time.Duration) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return fallback
+	}
+	return d
+}

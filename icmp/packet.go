@@ -3,6 +3,8 @@ package icmp
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
+	"sync"
 )
 
 // Packet type constants for the tunnel protocol.
@@ -15,32 +17,82 @@ const (
 
 // Flag bit positions.
 const (
-	FlagEncrypted uint8 = 1 << 3
-	FlagAuth      uint8 = 1 << 4
-	FlagSpoof     uint8 = 1 << 5
-	FlagFragment  uint8 = 1 << 2
+	FlagFragment   uint8 = 1 << 2
+	FlagEncrypted  uint8 = 1 << 3
+	FlagAuth       uint8 = 1 << 4
+	FlagSpoof      uint8 = 1 << 5
 	FlagCompressed uint8 = 1 << 6
+	FlagCRC        uint8 = 1 << 7 // CRC32 integrity check present
 )
 
 // Control subtypes.
 const (
-	ControlHeartbeat  uint8 = 0x01
-	ControlClose      uint8 = 0x02
-	ControlAuthOK     uint8 = 0x03
-	ControlAuthFail   uint8 = 0x04
-	ControlConnect    uint8 = 0x05
-	ControlConnectACK uint8 = 0x06
+	ControlHeartbeat   uint8 = 0x01
+	ControlClose       uint8 = 0x02
+	ControlAuthOK      uint8 = 0x03
+	ControlAuthFail    uint8 = 0x04
+	ControlConnect     uint8 = 0x05
+	ControlConnectACK  uint8 = 0x06
 	ControlConnectFail uint8 = 0x07
-	ControlACK        uint8 = 0x08
-	ControlSACK       uint8 = 0x09 // Selective ACK: confirm blocks and missing packets
+	ControlACK         uint8 = 0x08
+	ControlSACK        uint8 = 0x09
+	ControlResume      uint8 = 0x0A // Session resume request
+	ControlResumeACK   uint8 = 0x0B // Session resume acknowledged
+	ControlStats       uint8 = 0x0C // Real-time stats report
 )
 
 // StreamDataHeader wraps stream data with a stream ID and length.
 // Wire format: [2B stream_id][2B data_len][NB data]
 const StreamDataHeaderSize = 4
 
+// TunnelHeaderSize is the size of the tunnel packet header.
+// [1B flags][4B session_id][4B seq_num][2B data_len] = 11
+// With CRC: additional 4 bytes appended after data
+const TunnelHeaderSize = 11
+const CRCSize = 4
+
+// crc32 table (Castagnoli for hardware acceleration)
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+// --- Object Pools ---
+
+var tunnelPacketPool = sync.Pool{
+	New: func() interface{} {
+		return &TunnelPacket{}
+	},
+}
+
+// AcquireTunnelPacket gets a TunnelPacket from the pool.
+func AcquireTunnelPacket() *TunnelPacket {
+	pkt := tunnelPacketPool.Get().(*TunnelPacket)
+	pkt.Type = 0
+	pkt.Flags = 0
+	pkt.SessionID = 0
+	pkt.SeqNum = 0
+	pkt.Data = pkt.Data[:0]
+	pkt.StreamIDs = pkt.StreamIDs[:0]
+	pkt.ICMPID = 0
+	pkt.ICMPSeq = 0
+	pkt.Priority = 0
+	return pkt
+}
+
+// ReleaseTunnelPacket returns a TunnelPacket to the pool.
+func ReleaseTunnelPacket(pkt *TunnelPacket) {
+	if pkt == nil {
+		return
+	}
+	tunnelPacketPool.Put(pkt)
+}
+
+var encodeBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 2048)
+		return &b
+	},
+}
+
 // EncodeStreamData wraps data with a stream ID and length for multiplexing.
-// Multiple entries can be safely concatenated and decoded with DecodeAllStreamData.
 func EncodeStreamData(streamID uint16, data []byte) []byte {
 	buf := make([]byte, StreamDataHeaderSize+len(data))
 	binary.BigEndian.PutUint16(buf[0:2], streamID)
@@ -49,8 +101,19 @@ func EncodeStreamData(streamID uint16, data []byte) []byte {
 	return buf
 }
 
+// EncodeStreamDataInto encodes stream data into existing buffer, returns bytes written.
+func EncodeStreamDataInto(buf []byte, streamID uint16, data []byte) int {
+	needed := StreamDataHeaderSize + len(data)
+	if len(buf) < needed {
+		return 0
+	}
+	binary.BigEndian.PutUint16(buf[0:2], streamID)
+	binary.BigEndian.PutUint16(buf[2:4], uint16(len(data)))
+	copy(buf[4:], data)
+	return needed
+}
+
 // DecodeStreamData extracts the first stream ID and data from a payload.
-// For payloads with multiple concatenated stream entries, use DecodeAllStreamData.
 func DecodeStreamData(payload []byte) (streamID uint16, data []byte, err error) {
 	if len(payload) < StreamDataHeaderSize {
 		return 0, nil, fmt.Errorf("stream data too short")
@@ -71,8 +134,14 @@ type StreamEntry struct {
 }
 
 // DecodeAllStreamData decodes all concatenated stream entries from an aggregated payload.
+// Returns slices into the original payload to avoid copies.
 func DecodeAllStreamData(payload []byte) ([]StreamEntry, error) {
-	var entries []StreamEntry
+	// Pre-estimate capacity to avoid repeated slice growth
+	estEntries := len(payload) / 64
+	if estEntries < 4 {
+		estEntries = 4
+	}
+	entries := make([]StreamEntry, 0, estEntries)
 	offset := 0
 	for offset < len(payload) {
 		if offset+StreamDataHeaderSize > len(payload) {
@@ -84,25 +153,21 @@ func DecodeAllStreamData(payload []byte) ([]StreamEntry, error) {
 		if offset+dataLen > len(payload) {
 			return nil, fmt.Errorf("stream data length %d exceeds remaining payload at offset %d", dataLen, offset)
 		}
-		entry := StreamEntry{
+		// Zero-copy: reference into original payload
+		entries = append(entries, StreamEntry{
 			StreamID: streamID,
-			Data:     make([]byte, dataLen),
-		}
-		copy(entry.Data, payload[offset:offset+dataLen])
-		entries = append(entries, entry)
+			Data:     payload[offset : offset+dataLen],
+		})
 		offset += dataLen
 	}
 	return entries, nil
 }
 
-// TunnelHeaderSize is the size of the tunnel packet header.
-const TunnelHeaderSize = 11 // 1 flags + 4 session_id + 4 seq_num + 2 data_len
-
 // TunnelPacket represents a tunnel protocol packet carried inside ICMP payload.
 //
 // Wire format:
 //
-//	[1B flags][4B session_id][2B seq_num][2B data_len][NB data]
+//	[1B flags][4B session_id][4B seq_num][2B data_len][NB data][4B CRC32 (optional)]
 //
 // Flags byte:
 //
@@ -111,7 +176,8 @@ const TunnelHeaderSize = 11 // 1 flags + 4 session_id + 4 seq_num + 2 data_len
 //	bit 3: ENCRYPTED flag
 //	bit 4: AUTH flag
 //	bit 5: SPOOF flag
-//	bits 6-7: reserved
+//	bit 6: COMPRESSED flag
+//	bit 7: CRC flag
 type TunnelPacket struct {
 	Type      uint8    // Packet type (TypeData, TypeAuth, etc.)
 	Flags     uint8    // Additional flags
@@ -119,6 +185,7 @@ type TunnelPacket struct {
 	SeqNum    uint32   // Sequence number
 	Data      []byte   // Payload data
 	StreamIDs []uint16 // Associated stream IDs (in-memory only)
+	Priority  uint8    // 0=normal, 1=control, 2=critical (in-memory only)
 
 	// In-memory metadata (not encoded)
 	ICMPID  uint16
@@ -128,7 +195,22 @@ type TunnelPacket struct {
 // Encode serializes a TunnelPacket into bytes for transmission.
 func (p *TunnelPacket) Encode() []byte {
 	dataLen := len(p.Data)
-	buf := make([]byte, TunnelHeaderSize+dataLen)
+	crcEnabled := p.Flags&FlagCRC != 0
+	totalSize := TunnelHeaderSize + dataLen
+	if crcEnabled {
+		totalSize += CRCSize
+	}
+	buf := make([]byte, totalSize)
+	p.EncodeInto(buf)
+	return buf
+}
+
+// EncodeInto serializes a TunnelPacket into a pre-allocated buffer (zero-copy).
+// Buffer must be at least TunnelHeaderSize + len(Data) [+ CRCSize if CRC flag] bytes.
+// Returns bytes written.
+func (p *TunnelPacket) EncodeInto(buf []byte) int {
+	dataLen := len(p.Data)
+	crcEnabled := p.Flags&FlagCRC != 0
 
 	// Flags byte: type in lower 2 bits, other flags OR'd in
 	buf[0] = (p.Type & 0x03) | p.Flags
@@ -141,7 +223,16 @@ func (p *TunnelPacket) Encode() []byte {
 		copy(buf[11:], p.Data)
 	}
 
-	return buf
+	written := TunnelHeaderSize + dataLen
+
+	// Append CRC32 if enabled
+	if crcEnabled {
+		checksum := crc32.Checksum(buf[:written], crcTable)
+		binary.BigEndian.PutUint32(buf[written:written+CRCSize], checksum)
+		written += CRCSize
+	}
+
+	return written
 }
 
 // DecodeTunnelPacket deserializes bytes into a TunnelPacket.
@@ -153,9 +244,25 @@ func DecodeTunnelPacket(data []byte) (*TunnelPacket, error) {
 	flags := data[0]
 	dataLen := binary.BigEndian.Uint16(data[9:11])
 
-	if len(data) < TunnelHeaderSize+int(dataLen) {
+	expectedLen := TunnelHeaderSize + int(dataLen)
+	crcEnabled := flags&FlagCRC != 0
+	if crcEnabled {
+		expectedLen += CRCSize
+	}
+
+	if len(data) < expectedLen {
 		return nil, fmt.Errorf("data too short for declared payload: need %d, have %d",
-			TunnelHeaderSize+int(dataLen), len(data))
+			expectedLen, len(data))
+	}
+
+	// Verify CRC if present
+	if crcEnabled {
+		payloadEnd := TunnelHeaderSize + int(dataLen)
+		storedCRC := binary.BigEndian.Uint32(data[payloadEnd : payloadEnd+CRCSize])
+		computedCRC := crc32.Checksum(data[:payloadEnd], crcTable)
+		if storedCRC != computedCRC {
+			return nil, fmt.Errorf("CRC32 mismatch: stored=%08x computed=%08x (corruption detected)", storedCRC, computedCRC)
+		}
 	}
 
 	p := &TunnelPacket{
@@ -186,4 +293,9 @@ func (p *TunnelPacket) IsFragment() bool {
 // IsSpoofed returns true if the packet has the SPOOF flag.
 func (p *TunnelPacket) IsSpoofed() bool {
 	return p.Flags&FlagSpoof != 0
+}
+
+// HasCRC returns true if the packet has the CRC flag.
+func (p *TunnelPacket) HasCRC() bool {
+	return p.Flags&FlagCRC != 0
 }

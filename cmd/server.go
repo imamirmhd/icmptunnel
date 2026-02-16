@@ -7,8 +7,8 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
-	"github.com/user/icmptunnel/config"
-	"github.com/user/icmptunnel/tunnel"
+	"github.com/imamirmhd/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/tunnel"
 )
 
 var serverCmd = &cobra.Command{
@@ -35,7 +35,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	// Override log level if flag provided
 	logLevel, _ := cmd.Root().PersistentFlags().GetString("log-level")
 	if logLevel != "" {
 		cfg.Logging.Level = logLevel
@@ -47,6 +46,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Auth tokens: %d configured\n", len(cfg.AuthTokens))
 		fmt.Printf("  Encryption: %v (%s)\n", cfg.Encryption.Enabled, cfg.Encryption.Method)
 		fmt.Printf("  Max packet size: %d\n", cfg.ICMP.MaxPacketSize)
+		fmt.Printf("  Window size: %d\n", cfg.Transport.WindowSize)
+		fmt.Printf("  Compression: %s\n", cfg.Transport.Compression)
+		fmt.Printf("  Sender workers: %d\n", cfg.Transport.SenderWorkers)
 		return nil
 	}
 
@@ -59,13 +61,11 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Wait for signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
 	fmt.Printf("\nReceived %v, shutting down...\n", sig)
 
-	// Listen for a second signal for force exit
 	go func() {
 		sig2 := <-sigCh
 		fmt.Printf("\nReceived %v again, force exiting...\n", sig2)

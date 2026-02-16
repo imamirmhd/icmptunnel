@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/icmptunnel/config"
-	"github.com/user/icmptunnel/icmp"
+	"github.com/imamirmhd/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/icmp"
 )
 
 func TestSecurityAndAbuse(t *testing.T) {

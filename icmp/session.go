@@ -1,21 +1,46 @@
 package icmp
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
-	"sync"
-	"time"
-	"bytes"
-	"compress/zlib"
-	"io"
 	"sort"
-	"context"
+	"sync"
+	"sync/atomic"
+	"time"
 
-	"github.com/user/icmptunnel/logger"
+	"github.com/pierrec/lz4/v4"
+
+	"github.com/imamirmhd/icmptunnel/logger"
 )
+
+// ---- Compression Pools ----
+
+var lz4WriterPool = sync.Pool{
+	New: func() interface{} {
+		w := lz4.NewWriter(nil)
+		return w
+	},
+}
+
+var lz4ReaderPool = sync.Pool{
+	New: func() interface{} {
+		return lz4.NewReader(nil)
+	},
+}
+
+var compressBufPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
+// ---- Session ----
 
 // Session tracks state for a single tunnel connection.
 type Session struct {
@@ -30,7 +55,7 @@ type Session struct {
 	Streams       map[uint16]*Stream // Multiplexed streams within a session
 	recvBuf       map[uint32]*TunnelPacket
 	NextRecvSeq   uint32
-	
+
 	// NAT tracking
 	LastICMPID      uint16
 	LastICMPSeq     uint16
@@ -40,18 +65,23 @@ type Session struct {
 	LastSrcIP       net.IP
 	LastRouteFlag   uint8
 	LastRelayIP     net.IP
-	
-	// Sliding Window & Congestion Control
-	Mu            sync.RWMutex
-	inflight      map[uint32]*inflightPacket
-	cwnd          int
-	ssthresh      int
-	srtt          time.Duration
-	rttvar        time.Duration
-	rto           time.Duration
 
-	// SACK state
-	receivedSeqs  map[uint32]bool
+	// Sliding Window & Congestion Control
+	Mu       sync.RWMutex
+	inflight map[uint32]*inflightPacket
+	cwnd     int
+	ssthresh int
+	srtt     time.Duration
+	rttvar   time.Duration
+	rto      time.Duration
+
+	// Fast retransmit tracking
+	dupAckCount  map[uint32]int // seq -> duplicate ACK count
+	lastAckedSeq uint32
+
+	// SACK state - bounded ring buffer
+	receivedSeqs   map[uint32]bool
+	recvSeqCleanup uint32 // counter for periodic cleanup
 
 	// ICMP Slot tracking (for NAT compatibility)
 	icmpSlots chan icmpSlot
@@ -60,7 +90,32 @@ type Session struct {
 	Ctx    context.Context
 	Cancel context.CancelFunc
 
-	cond   *sync.Cond
+	// Condition variable for send capacity signaling
+	sendCapCh chan struct{}
+
+	// Stats (atomic - lock-free)
+	StatsTxPackets   uint64
+	StatsRxPackets   uint64
+	StatsTxBytes     uint64
+	StatsRxBytes     uint64
+	StatsRetransmits uint64
+	StatsLossRate    uint64 // fixed-point: value/10000 = rate
+	StatsCWND        uint64
+	StatsInflight    uint64
+	StatsRTT         uint64 // nanoseconds
+
+	// Session state for zero-downtime reconnect
+	StateSnapshot *SessionSnapshot
+}
+
+// SessionSnapshot captures session state for fast recovery.
+type SessionSnapshot struct {
+	SessionID   uint32
+	NextSeqSend uint32
+	NextSeqRecv uint32
+	AuthToken   string
+	StreamIDs   []uint16
+	Timestamp   time.Time
 }
 
 type icmpSlot struct {
@@ -72,6 +127,7 @@ type inflightPacket struct {
 	Pkt      *TunnelPacket
 	SentAt   time.Time
 	Retries  int
+	Priority uint8 // 0=data, 1=control, 2=critical
 }
 
 type SACK struct {
@@ -88,6 +144,14 @@ type Stream struct {
 	Done        chan struct{}
 	CreatedAt   time.Time
 	State       uint8
+	Priority    uint8 // 0=normal, 1=high (control/streaming)
+
+	// Per-stream stats
+	TxBytes uint64
+	RxBytes uint64
+
+	// Crash guard
+	closeOnce sync.Once
 }
 
 const (
@@ -100,23 +164,28 @@ const (
 // SessionManager manages multiple tunnel sessions.
 type SessionManager struct {
 	sessions       map[uint32]*Session
-	sessionsByAddr map[string]*Session // keyed by client IP string
+	sessionsByAddr map[string]*Session
 	mu             sync.RWMutex
 	log            *logger.Logger
 	timeout        time.Duration
 	defaultCWND    int
 	defaultSST     int
+
+	// Session snapshots for zero-downtime reconnect
+	snapshots map[uint32]*SessionSnapshot
+	snapMu    sync.RWMutex
 }
 
 // NewSessionManager creates a new session manager.
 func NewSessionManager(timeout time.Duration) *SessionManager {
-	return NewSessionManagerWithParams(timeout, 512, 2048)
+	return NewSessionManagerWithParams(timeout, 2048, 8192)
 }
 
 func NewSessionManagerWithParams(timeout time.Duration, cwnd, ssthresh int) *SessionManager {
 	sm := &SessionManager{
 		sessions:       make(map[uint32]*Session),
 		sessionsByAddr: make(map[string]*Session),
+		snapshots:      make(map[uint32]*SessionSnapshot),
 		log:            logger.Default().WithComponent("session-mgr"),
 		timeout:        timeout,
 		defaultCWND:    cwnd,
@@ -131,36 +200,36 @@ func (sm *SessionManager) CreateSessionWithID(clientAddr net.IP, id uint32) *Ses
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	// Check for existing session with same ID. 
-	// We allow multiple sessions per IP (sessionsByAddr) to support NAT and simulation (localhost).
 	if old, ok := sm.sessions[id]; ok {
 		sm.log.Info("Replacing existing session %08x for client %s", id, clientAddr)
+		// Save snapshot for potential resume
+		sm.saveSnapshotLocked(old)
 		delete(sm.sessionsByAddr, old.ClientAddr.String())
 		old.Close()
 	}
 
 	now := time.Now()
 	session := &Session{
-		ID:           id,
-		ClientAddr:   clientAddr,
-		CreatedAt:     now,
-		LastActivity:  now,
-		Streams:       make(map[uint16]*Stream),
-		recvBuf:       make(map[uint32]*TunnelPacket),
-		NextSeqSend:   0,
-		NextRecvSeq:   0,
-		inflight:      make(map[uint32]*inflightPacket),
-		cwnd:          sm.defaultCWND,
-		ssthresh:      sm.defaultSST,
-		rto:           time.Second,
-		receivedSeqs:  make(map[uint32]bool),
-		icmpSlots:     make(chan icmpSlot, 8192),
+		ID:              id,
+		ClientAddr:      clientAddr,
+		CreatedAt:       now,
+		LastActivity:    now,
+		Streams:         make(map[uint16]*Stream),
+		recvBuf:         make(map[uint32]*TunnelPacket),
+		NextSeqSend:     0,
+		NextRecvSeq:     0,
+		inflight:        make(map[uint32]*inflightPacket),
+		dupAckCount:     make(map[uint32]int),
+		cwnd:            sm.defaultCWND,
+		ssthresh:        sm.defaultSST,
+		rto:             500 * time.Millisecond,
+		receivedSeqs:    make(map[uint32]bool),
+		icmpSlots:       make(chan icmpSlot, 65536),
 		OutboundICMPID:  uint16(generateSessionID() & 0xFFFF),
 		OutboundICMPSeq: 0,
 		PushICMPID:      uint16(generateSessionID() & 0xFFFF),
-		cond:            sync.NewCond(&sync.Mutex{}),
+		sendCapCh:       make(chan struct{}, 1),
 	}
-	session.cond.L = &session.Mu
 
 	ctx, cancel := context.WithCancel(context.Background())
 	session.Ctx = ctx
@@ -168,8 +237,41 @@ func (sm *SessionManager) CreateSessionWithID(clientAddr net.IP, id uint32) *Ses
 
 	sm.sessions[id] = session
 	sm.sessionsByAddr[clientAddr.String()] = session
-	sm.log.Info("Created session %08x for client %s", id, clientAddr)
+	sm.log.Info("Created session %08x for client %s (cwnd=%d, ssthresh=%d)", id, clientAddr, sm.defaultCWND, sm.defaultSST)
 	return session
+}
+
+func (sm *SessionManager) saveSnapshotLocked(s *Session) {
+	s.Mu.RLock()
+	streamIDs := make([]uint16, 0, len(s.Streams))
+	for id := range s.Streams {
+		streamIDs = append(streamIDs, id)
+	}
+	s.Mu.RUnlock()
+
+	snap := &SessionSnapshot{
+		SessionID:   s.ID,
+		NextSeqSend: s.NextSeqSend,
+		NextSeqRecv: s.NextRecvSeq,
+		AuthToken:   s.AuthToken,
+		StreamIDs:   streamIDs,
+		Timestamp:   time.Now(),
+	}
+
+	sm.snapMu.Lock()
+	sm.snapshots[s.ID] = snap
+	sm.snapMu.Unlock()
+}
+
+// GetSnapshot returns a session snapshot for resume, if available.
+func (sm *SessionManager) GetSnapshot(id uint32) *SessionSnapshot {
+	sm.snapMu.RLock()
+	defer sm.snapMu.RUnlock()
+	snap := sm.snapshots[id]
+	if snap != nil && time.Since(snap.Timestamp) > 5*time.Minute {
+		return nil // Too old
+	}
+	return snap
 }
 
 // CreateSession creates a new session for the given client.
@@ -198,6 +300,7 @@ func (sm *SessionManager) RemoveSession(id uint32) {
 	defer sm.mu.Unlock()
 
 	if session, ok := sm.sessions[id]; ok {
+		sm.saveSnapshotLocked(session)
 		session.Close()
 		delete(sm.sessionsByAddr, session.ClientAddr.String())
 		delete(sm.sessions, id)
@@ -231,11 +334,25 @@ func (s *Session) RecordSent(pkt *TunnelPacket) {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 	now := time.Now()
-	s.inflight[pkt.SeqNum] = &inflightPacket{
-		Pkt:    pkt,
-		SentAt: now,
+	priority := uint8(0)
+	if pkt.Type == TypeControl {
+		priority = 1
+		if len(pkt.Data) > 0 {
+			sub := pkt.Data[0]
+			if sub == ControlConnect || sub == ControlAuthOK || sub == ControlAuthFail || sub == ControlClose {
+				priority = 2 // Critical
+			}
+		}
 	}
-	s.LastActivity = now // Keep session alive while sending
+	s.inflight[pkt.SeqNum] = &inflightPacket{
+		Pkt:      pkt,
+		SentAt:   now,
+		Priority: priority,
+	}
+	s.LastActivity = now
+	atomic.AddUint64(&s.StatsTxPackets, 1)
+	atomic.AddUint64(&s.StatsTxBytes, uint64(len(pkt.Data)))
+	atomic.StoreUint64(&s.StatsInflight, uint64(len(s.inflight)))
 }
 
 // ProcessACK handles an incoming ACK or SACK.
@@ -246,13 +363,13 @@ func (s *Session) ProcessACK(ackedSeq uint32, sackBlocks []uint32) []*TunnelPack
 
 	var acknowledged []*TunnelPacket
 
-	// Simple cumulative ACK
+	// Cumulative ACK
 	for seq, inflight := range s.inflight {
-		// Circular distance check: seq is acked if (ackedSeq - seq) < 2^31
 		if int32(ackedSeq-seq) >= 0 {
 			acknowledged = append(acknowledged, inflight.Pkt)
-			s.UpdateRTT(time.Since(inflight.SentAt))
+			s.UpdateRTTLocked(time.Since(inflight.SentAt))
 			delete(s.inflight, seq)
+			delete(s.dupAckCount, seq)
 		}
 	}
 
@@ -260,12 +377,12 @@ func (s *Session) ProcessACK(ackedSeq uint32, sackBlocks []uint32) []*TunnelPack
 	for i := 0; i+1 < len(sackBlocks); i += 2 {
 		start := sackBlocks[i]
 		end := sackBlocks[i+1]
-		// Loop from start to end in uint32 space
 		for seq := start; ; {
 			if inflight, ok := s.inflight[seq]; ok {
 				acknowledged = append(acknowledged, inflight.Pkt)
-				s.UpdateRTT(time.Since(inflight.SentAt))
+				s.UpdateRTTLocked(time.Since(inflight.SentAt))
 				delete(s.inflight, seq)
+				delete(s.dupAckCount, seq)
 			}
 			if seq == end {
 				break
@@ -277,30 +394,41 @@ func (s *Session) ProcessACK(ackedSeq uint32, sackBlocks []uint32) []*TunnelPack
 	// Update congestion window
 	if len(acknowledged) > 0 {
 		if s.cwnd < s.ssthresh {
-			s.cwnd += len(acknowledged) // Slow start: grow by ACKed count
+			// Slow start: grow by ACKed count (exponential growth)
+			s.cwnd += len(acknowledged)
 		} else {
-			// Congestion avoidance: more conservative growth
-			growth := len(acknowledged) / 8
+			// Congestion avoidance: conservative linear growth
+			growth := len(acknowledged) / 4
 			if growth < 1 {
 				growth = 1
 			}
 			s.cwnd += growth
 		}
-		
-		// Cap cwnd to prevent buffer bloat/overflow (16MB buffer -> ~11000 pkts, so 4096 is safe ~5.7MB)
-		if s.cwnd > 4096 {
-			s.cwnd = 4096
+
+		// Cap cwnd
+		if s.cwnd > 16384 {
+			s.cwnd = 16384
 		}
+
+		// Signal send capacity availability
+		select {
+		case s.sendCapCh <- struct{}{}:
+		default:
+		}
+
+		// Update stats
+		atomic.StoreUint64(&s.StatsCWND, uint64(s.cwnd))
+		atomic.StoreUint64(&s.StatsInflight, uint64(len(s.inflight)))
 	}
 
-	if len(acknowledged) > 0 {
-		s.cond.Broadcast()
-	}
+	// Track for fast retransmit
+	s.lastAckedSeq = ackedSeq
 
 	return acknowledged
 }
 
-func (s *Session) UpdateRTT(measured time.Duration) {
+// UpdateRTTLocked updates RTT estimates. Must be called with Mu held.
+func (s *Session) UpdateRTTLocked(measured time.Duration) {
 	if s.srtt == 0 {
 		s.srtt = measured
 		s.rttvar = measured / 2
@@ -313,21 +441,30 @@ func (s *Session) UpdateRTT(measured time.Duration) {
 		s.srtt = time.Duration(0.875*float64(s.srtt) + 0.125*float64(measured))
 	}
 	s.rto = s.srtt + 4*s.rttvar
-	if s.rto < 50*time.Millisecond {
-		s.rto = 50 * time.Millisecond
+	if s.rto < 25*time.Millisecond {
+		s.rto = 25 * time.Millisecond
 	}
-	if s.rto > 3*time.Second {
-		s.rto = 3 * time.Second
+	if s.rto > 10*time.Second {
+		s.rto = 10 * time.Second
 	}
+	atomic.StoreUint64(&s.StatsRTT, uint64(s.srtt.Nanoseconds()))
 }
 
-// GetRetransmissions returns packets that have timed out.
+// UpdateRTT updates RTT estimates (public, acquires lock).
+func (s *Session) UpdateRTT(measured time.Duration) {
+	s.Mu.Lock()
+	s.UpdateRTTLocked(measured)
+	s.Mu.Unlock()
+}
+
+// GetRetransmissions returns packets that have timed out or need fast retransmit.
 func (s *Session) GetRetransmissions() []*TunnelPacket {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
 	var retrans []*TunnelPacket
 	now := time.Now()
+
 	for seq, inflight := range s.inflight {
 		// Clean up packets for closed streams
 		if inflight.Pkt.Type == TypeData && len(inflight.Pkt.StreamIDs) > 0 {
@@ -344,32 +481,81 @@ func (s *Session) GetRetransmissions() []*TunnelPacket {
 			}
 		}
 
-		// Enforce retry limit (avoid infinite loops for dead clients)
-		if inflight.Retries > 50 {
+		// Enforce retry limit
+		maxRetries := 30
+		if inflight.Priority >= 2 {
+			maxRetries = 100 // Critical packets get more retries
+		}
+		if inflight.Retries > maxRetries {
 			delete(s.inflight, seq)
 			continue
 		}
 
+		// Timeout-based retransmit
 		if now.Sub(inflight.SentAt) > s.rto {
 			inflight.SentAt = now
 			inflight.Retries++
 			retrans = append(retrans, inflight.Pkt)
+			atomic.AddUint64(&s.StatsRetransmits, 1)
 		}
 	}
 
 	if len(retrans) > 0 {
-		// Mild congestion back-off for ICMP tunnel (localhost retransmissions
-		// are usually scheduling delays, not real congestion)
+		// Mild congestion back-off
 		s.ssthresh = s.cwnd * 3 / 4
-		if s.ssthresh < 64 {
-			s.ssthresh = 64
+		if s.ssthresh < 128 {
+			s.ssthresh = 128
 		}
-		// Very mild reduction: 7/8 of current cwnd
 		newCwnd := s.cwnd * 7 / 8
 		if newCwnd < s.ssthresh {
 			newCwnd = s.ssthresh
 		}
 		s.cwnd = newCwnd
+		atomic.StoreUint64(&s.StatsCWND, uint64(s.cwnd))
+	}
+
+	// Sort by priority (critical first)
+	sort.Slice(retrans, func(i, j int) bool {
+		pi, pj := uint8(0), uint8(0)
+		if inf, ok := s.inflight[retrans[i].SeqNum]; ok {
+			pi = inf.Priority
+		}
+		if inf, ok := s.inflight[retrans[j].SeqNum]; ok {
+			pj = inf.Priority
+		}
+		return pi > pj
+	})
+
+	return retrans
+}
+
+// FastRetransmit handles duplicate ACK detection and triggers immediate retransmit.
+// Returns packets that should be retransmitted immediately.
+func (s *Session) FastRetransmit(ackedSeq uint32) []*TunnelPacket {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	var retrans []*TunnelPacket
+	nextSeq := ackedSeq + 1
+
+	s.dupAckCount[nextSeq]++
+	if s.dupAckCount[nextSeq] >= 3 {
+		// 3 duplicate ACKs -> fast retransmit
+		if inflight, ok := s.inflight[nextSeq]; ok {
+			inflight.SentAt = time.Now()
+			inflight.Retries++
+			retrans = append(retrans, inflight.Pkt)
+			atomic.AddUint64(&s.StatsRetransmits, 1)
+		}
+		delete(s.dupAckCount, nextSeq)
+
+		// Fast recovery: halve cwnd
+		s.ssthresh = s.cwnd / 2
+		if s.ssthresh < 128 {
+			s.ssthresh = 128
+		}
+		s.cwnd = s.ssthresh
+		atomic.StoreUint64(&s.StatsCWND, uint64(s.cwnd))
 	}
 
 	return retrans
@@ -389,6 +575,20 @@ func (s *Session) GetCWND() int {
 	return s.cwnd
 }
 
+// GetRTT returns the current smoothed RTT.
+func (s *Session) GetRTT() time.Duration {
+	s.Mu.RLock()
+	defer s.Mu.RUnlock()
+	return s.srtt
+}
+
+// GetRTO returns the current retransmission timeout.
+func (s *Session) GetRTO() time.Duration {
+	s.Mu.RLock()
+	defer s.Mu.RUnlock()
+	return s.rto
+}
+
 // GenerateSACK creates a SACK message based on received packets.
 func (s *Session) GenerateSACK() *SACK {
 	s.Mu.RLock()
@@ -400,16 +600,14 @@ func (s *Session) GenerateSACK() *SACK {
 
 	var keys []uint32
 	for seq := range s.receivedSeqs {
-		// Circular distance check: include if seq is ahead of NextRecvSeq
-		if int32(seq - s.NextRecvSeq) >= 0 {
+		if int32(seq-s.NextRecvSeq) >= 0 {
 			keys = append(keys, seq)
 		}
 	}
 	if len(keys) == 0 {
 		return sack
 	}
-	
-	// Sort keys
+
 	sort.Slice(keys, func(i, j int) bool {
 		return int32(keys[i]-keys[j]) < 0
 	})
@@ -441,11 +639,12 @@ func (s *Session) MarkReceived(seq uint32) {
 	defer s.Mu.Unlock()
 	s.receivedSeqs[seq] = true
 
-	// Cleanup: periodically remove very old sequence numbers to keep map size sane
-	if len(s.receivedSeqs) > 30000 {
-		for s_seq := range s.receivedSeqs {
-			if int32(s.NextRecvSeq-s_seq) > 20000 {
-				delete(s.receivedSeqs, s_seq)
+	// Bounded cleanup: keep map under 65536 entries
+	s.recvSeqCleanup++
+	if s.recvSeqCleanup%1000 == 0 && len(s.receivedSeqs) > 65536 {
+		for sSeq := range s.receivedSeqs {
+			if int32(s.NextRecvSeq-sSeq) > 32768 {
+				delete(s.receivedSeqs, sSeq)
 			}
 		}
 	}
@@ -466,7 +665,7 @@ func (s *Session) AddICMPSlot(id, seq uint16) {
 	select {
 	case s.icmpSlots <- slot:
 	default:
-		// Channel full? Drain one and add new (keep most recent)
+		// Channel full: drain oldest and add new
 		select {
 		case <-s.icmpSlots:
 		default:
@@ -490,27 +689,26 @@ func (s *Session) GetICMPSlot(ctx context.Context) (uint16, uint16, error) {
 	}
 }
 
-// isOlder returns true if seq is older than base by more than threshold, considering wraparound.
+// isOlder returns true if seq is older than base by more than threshold.
 func (s *Session) isOlder(seq, base uint32, threshold uint32) bool {
 	diff := int32(base - seq)
 	return diff > int32(threshold)
 }
 
-// IsDuplicate returns true if the sequence number has already been processed or is currently buffered.
+// IsDuplicate returns true if the sequence number has already been processed.
 func (s *Session) IsDuplicate(seq uint32) bool {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
-	
+
 	if _, ok := s.recvBuf[seq]; ok {
 		return true
 	}
-	
-	// A positive signed diff means seq is behind NextRecvSeq (i.e., already processed).
+
 	diff := int32(s.NextRecvSeq - seq)
 	if diff > 0 {
 		return true
 	}
-	
+
 	return false
 }
 
@@ -532,23 +730,20 @@ func (s *Session) ProcessIncoming(pkt *TunnelPacket) []*TunnelPacket {
 	s.LastICMPID = pkt.ICMPID
 	s.LastICMPSeq = pkt.ICMPSeq
 	s.receivedSeqs[pkt.SeqNum] = true
+	atomic.AddUint64(&s.StatsRxPackets, 1)
+	atomic.AddUint64(&s.StatsRxBytes, uint64(len(pkt.Data)))
 
-	// If this is exactly what we expect
 	if pkt.SeqNum == s.NextRecvSeq {
 		s.NextRecvSeq++
-		// Packets < NextRecvSeq are implicitly acked, so remove from map to keep it small
 		delete(s.receivedSeqs, pkt.SeqNum)
 		result := []*TunnelPacket{pkt}
 
-		// Check buffer for subsequent packets
+		// Drain buffer for subsequent in-order packets
 		for {
 			if nextPkt, ok := s.recvBuf[s.NextRecvSeq]; ok {
-				// Re-stamp buffered packets with triggering ID/Seq
 				nextPkt.ICMPID = pkt.ICMPID
 				nextPkt.ICMPSeq = pkt.ICMPSeq
 				result = append(result, nextPkt)
-				
-				// Clean up maps
 				delete(s.receivedSeqs, s.NextRecvSeq)
 				delete(s.recvBuf, s.NextRecvSeq)
 				s.NextRecvSeq++
@@ -559,33 +754,49 @@ func (s *Session) ProcessIncoming(pkt *TunnelPacket) []*TunnelPacket {
 		return result
 	}
 
-	// Out of order: buffer it if it's not too far ahead
+	// Out of order: buffer if not too far ahead
 	diff := int32(pkt.SeqNum - s.NextRecvSeq)
-	if diff > 0 && diff < 10000 { // Max 10000 packets ahead
+	if diff > 0 && diff < 20000 {
 		s.recvBuf[pkt.SeqNum] = pkt
 	}
-	
+
 	return nil
 }
 
-// Compress applies zlib compression to data.
+// ---- Compression (LZ4 - 10x faster than zlib) ----
+
+// Compress applies LZ4 compression to data.
 func (s *Session) Compress(data []byte) []byte {
-	var b bytes.Buffer
-	w := zlib.NewWriter(&b)
+	buf := compressBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer compressBufPool.Put(buf)
+
+	w := lz4WriterPool.Get().(*lz4.Writer)
+	w.Reset(buf)
+	defer lz4WriterPool.Put(w)
+
 	w.Write(data)
 	w.Close()
-	return b.Bytes()
+
+	result := make([]byte, buf.Len())
+	copy(result, buf.Bytes())
+	return result
 }
 
-// Decompress removes zlib compression from data.
+// Decompress removes LZ4 compression from data.
 func (s *Session) Decompress(data []byte) ([]byte, error) {
-	r, err := zlib.NewReader(bytes.NewReader(data))
+	r := lz4ReaderPool.Get().(*lz4.Reader)
+	r.Reset(bytes.NewReader(data))
+	defer lz4ReaderPool.Put(r)
+
+	result, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
-	defer r.Close()
-	return io.ReadAll(r)
+	return result, nil
 }
+
+// ---- Stream Management ----
 
 // AddStream adds a new data stream to the session.
 func (s *Session) AddStream(protocol, destination string) *Stream {
@@ -597,7 +808,7 @@ func (s *Session) AddStream(protocol, destination string) *Stream {
 		ID:          id,
 		Protocol:    protocol,
 		Destination: destination,
-		DataChan:    make(chan []byte, 4096),
+		DataChan:    make(chan []byte, 8192),
 		Done:        make(chan struct{}),
 		CreatedAt:   time.Now(),
 	}
@@ -610,6 +821,13 @@ func (s *Stream) SetState(state uint8) {
 	s.State = state
 }
 
+// SafeClose closes the stream's Done channel exactly once (crash guard).
+func (s *Stream) SafeClose() {
+	s.closeOnce.Do(func() {
+		close(s.Done)
+	})
+}
+
 // AddStreamWithID adds a new data stream to the session with a specific ID.
 func (s *Session) AddStreamWithID(id uint16, protocol, destination string) *Stream {
 	s.Mu.Lock()
@@ -619,7 +837,7 @@ func (s *Session) AddStreamWithID(id uint16, protocol, destination string) *Stre
 		ID:          id,
 		Protocol:    protocol,
 		Destination: destination,
-		DataChan:    make(chan []byte, 16384),
+		DataChan:    make(chan []byte, 32768),
 		Done:        make(chan struct{}),
 		CreatedAt:   time.Now(),
 		State:       StreamStateConnecting,
@@ -634,7 +852,7 @@ func (s *Session) RemoveStream(id uint16) {
 	defer s.Mu.Unlock()
 
 	if stream, ok := s.Streams[id]; ok {
-		close(stream.Done)
+		stream.SafeClose()
 		delete(s.Streams, id)
 	}
 }
@@ -653,7 +871,7 @@ func (sm *SessionManager) Iterate(f func(*Session)) {
 	}
 }
 
-// cleanupLoop periodically removes timed-out sessions.
+// cleanupLoop periodically removes timed-out sessions and stale snapshots.
 func (sm *SessionManager) cleanupLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -666,6 +884,7 @@ func (sm *SessionManager) cleanupLoop() {
 			if now.Sub(session.LastActivity) > sm.timeout {
 				session.Mu.Unlock()
 				sm.log.Info("Session %08x timed out (idle %v)", id, now.Sub(session.LastActivity))
+				sm.saveSnapshotLocked(session)
 				session.Close()
 				delete(sm.sessionsByAddr, session.ClientAddr.String())
 				delete(sm.sessions, id)
@@ -674,6 +893,15 @@ func (sm *SessionManager) cleanupLoop() {
 			}
 		}
 		sm.mu.Unlock()
+
+		// Clean old snapshots
+		sm.snapMu.Lock()
+		for id, snap := range sm.snapshots {
+			if time.Since(snap.Timestamp) > 10*time.Minute {
+				delete(sm.snapshots, id)
+			}
+		}
+		sm.snapMu.Unlock()
 	}
 }
 
@@ -684,16 +912,32 @@ func (s *Session) Close() {
 	if s.Cancel != nil {
 		s.Cancel()
 	}
-	// Close all streams
+	// Close all streams with crash guard
 	for id, stream := range s.Streams {
-		select {
-		case <-stream.Done:
-		default:
-			close(stream.Done)
-		}
+		stream.SafeClose()
 		delete(s.Streams, id)
 	}
 	s.Mu.Unlock()
+}
+
+// TakeSnapshot creates a snapshot of current session state.
+func (s *Session) TakeSnapshot() *SessionSnapshot {
+	s.Mu.RLock()
+	defer s.Mu.RUnlock()
+
+	streamIDs := make([]uint16, 0, len(s.Streams))
+	for id := range s.Streams {
+		streamIDs = append(streamIDs, id)
+	}
+
+	return &SessionSnapshot{
+		SessionID:   s.ID,
+		NextSeqSend: s.NextSeqSend,
+		NextSeqRecv: s.NextRecvSeq,
+		AuthToken:   s.AuthToken,
+		StreamIDs:   streamIDs,
+		Timestamp:   time.Now(),
+	}
 }
 
 // ActiveSessions returns the number of active sessions.
@@ -725,19 +969,17 @@ func GenerateStreamID() uint16 {
 	return uint16(n.Int64()) + 1
 }
 
-// ConnectRequest is embedded in a CONTROL/ControlConnect packet.
-// Wire format: [2B stream_id][1B proto_len][NB proto][2B dest_len][NB dest]
+// ---- Connect Request ----
+
 type ConnectRequest struct {
 	StreamID    uint16
 	Protocol    string
 	Destination string
 }
 
-// EncodeConnectRequest serializes a connect request.
 func EncodeConnectRequest(req *ConnectRequest) []byte {
 	protoBytes := []byte(req.Protocol)
 	destBytes := []byte(req.Destination)
-	// Format: [1B subtype][2B stream_id][1B proto_len][NB proto][2B dest_len][NB dest]
 	buf := make([]byte, 1+2+1+len(protoBytes)+2+len(destBytes))
 
 	buf[0] = ControlConnect
@@ -751,7 +993,6 @@ func EncodeConnectRequest(req *ConnectRequest) []byte {
 	return buf
 }
 
-// DecodeConnectRequest deserializes a connect request (payload after subtype).
 func DecodeConnectRequest(data []byte) (*ConnectRequest, error) {
 	if len(data) < 7 {
 		return nil, fmt.Errorf("connect request too short")
@@ -778,7 +1019,8 @@ func DecodeConnectRequest(data []byte) (*ConnectRequest, error) {
 	return req, nil
 }
 
-// EncodeControlMessage creates a simple control message with subtype and optional data value.
+// ---- Control Messages ----
+
 func EncodeControlMessage(subtype uint8, data uint32) []byte {
 	buf := make([]byte, 5)
 	buf[0] = subtype
@@ -786,7 +1028,6 @@ func EncodeControlMessage(subtype uint8, data uint32) []byte {
 	return buf
 }
 
-// DecodeControlMessage extracts subtype and data value from a control packet.
 func DecodeControlMessage(data []byte) (subtype uint8, value uint32, err error) {
 	if len(data) < 1 {
 		return 0, 0, fmt.Errorf("control message too short")
@@ -797,7 +1038,9 @@ func DecodeControlMessage(data []byte) (subtype uint8, value uint32, err error) 
 	}
 	return subtype, value, nil
 }
-// EncodeSACK serializes a SACK message.
+
+// ---- SACK Encoding/Decoding ----
+
 func EncodeSACK(s *SACK) []byte {
 	buf := make([]byte, 5+len(s.Blocks)*4)
 	buf[0] = ControlSACK
@@ -808,17 +1051,15 @@ func EncodeSACK(s *SACK) []byte {
 	return buf
 }
 
-// EncodePacket wraps a SACK in a TunnelPacket.
 func (s *SACK) EncodePacket(sessionID uint32) *TunnelPacket {
 	return &TunnelPacket{
 		Type:      TypeControl,
 		SessionID: sessionID,
-		SeqNum:    0, // SACKs are not reliable themselves (sent frequently)
+		SeqNum:    0,
 		Data:      EncodeSACK(s),
 	}
 }
 
-// DecodeSACK deserializes a SACK message.
 func DecodeSACK(data []byte) (*SACK, error) {
 	if len(data) < 5 {
 		return nil, fmt.Errorf("SACK too short")
@@ -832,33 +1073,102 @@ func DecodeSACK(data []byte) (*SACK, error) {
 	return s, nil
 }
 
+// ---- Send Capacity (No goroutine leak) ----
+
 // WaitSendCapacity blocks until the session has window availability to send.
+// Uses channel-based signaling to avoid goroutine leaks.
 func (s *Session) WaitSendCapacity(ctx context.Context) error {
-	s.Mu.Lock()
-	defer s.Mu.Unlock()
+	s.Mu.RLock()
+	if len(s.inflight) < s.cwnd {
+		s.Mu.RUnlock()
+		return nil
+	}
+	s.Mu.RUnlock()
 
-	for len(s.inflight) >= s.cwnd {
-		// Use a temporary channel to mix Sync.Cond with Context
-		ch := make(chan struct{})
-		go func() {
-			s.Mu.Lock()
-			s.cond.Wait()
-			s.Mu.Unlock()
-			close(ch)
-		}()
-
-		s.Mu.Unlock()
+	// Wait for capacity signal or context cancellation
+	for {
 		select {
 		case <-ctx.Done():
-			s.Mu.Lock()
 			return ctx.Err()
 		case <-s.Ctx.Done():
-			s.Mu.Lock()
 			return fmt.Errorf("session closed")
-		case <-ch:
-			// Condition broadcasted, reacquire lock and check loop
-			s.Mu.Lock()
+		case <-s.sendCapCh:
+			s.Mu.RLock()
+			if len(s.inflight) < s.cwnd {
+				s.Mu.RUnlock()
+				return nil
+			}
+			s.Mu.RUnlock()
+			// Still full, loop again
+		case <-time.After(100 * time.Millisecond):
+			s.Mu.RLock()
+			if len(s.inflight) < s.cwnd {
+				s.Mu.RUnlock()
+				return nil
+			}
+			s.Mu.RUnlock()
 		}
 	}
-	return nil
+}
+
+// ---- Stats ----
+
+// SessionStats holds real-time session metrics.
+type SessionStats struct {
+	TxPackets   uint64
+	RxPackets   uint64
+	TxBytes     uint64
+	RxBytes     uint64
+	Retransmits uint64
+	LossRate    float64
+	CWND        int
+	Inflight    int
+	RTT         time.Duration
+	RTO         time.Duration
+	Streams     int
+}
+
+// GetStats returns current session statistics.
+func (s *Session) GetStats() SessionStats {
+	s.Mu.RLock()
+	defer s.Mu.RUnlock()
+	return SessionStats{
+		TxPackets:   atomic.LoadUint64(&s.StatsTxPackets),
+		RxPackets:   atomic.LoadUint64(&s.StatsRxPackets),
+		TxBytes:     atomic.LoadUint64(&s.StatsTxBytes),
+		RxBytes:     atomic.LoadUint64(&s.StatsRxBytes),
+		Retransmits: atomic.LoadUint64(&s.StatsRetransmits),
+		LossRate:    float64(atomic.LoadUint64(&s.StatsLossRate)) / 10000.0,
+		CWND:        s.cwnd,
+		Inflight:    len(s.inflight),
+		RTT:         s.srtt,
+		RTO:         s.rto,
+		Streams:     len(s.Streams),
+	}
+}
+
+// ---- Load Shedding ----
+
+// ShouldShed returns true if the session is under extreme load and should drop low-priority traffic.
+func (s *Session) ShouldShed() bool {
+	s.Mu.RLock()
+	defer s.Mu.RUnlock()
+	// Shed if inflight > 2x cwnd (severe overload)
+	return len(s.inflight) > s.cwnd*2
+}
+
+// GetLowestPriorityStream returns the stream with lowest priority for shedding.
+func (s *Session) GetLowestPriorityStream() uint16 {
+	s.Mu.RLock()
+	defer s.Mu.RUnlock()
+
+	var lowestPri uint8 = 255
+	var lowestID uint16 = 0
+	for id, stream := range s.Streams {
+		if stream.Priority < lowestPri {
+			lowestPri = stream.Priority
+			lowestID = id
+		}
+	}
+	return lowestID
 }

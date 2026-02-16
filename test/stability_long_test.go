@@ -11,7 +11,7 @@ import (
 	"time"
 	"strconv"
 
-	"github.com/user/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/config"
 )
 
 func TestLongDurationStability(t *testing.T) {

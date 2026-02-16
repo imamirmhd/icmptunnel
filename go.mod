@@ -1,9 +1,10 @@
-module github.com/user/icmptunnel
+module github.com/imamirmhd/icmptunnel
 
 go 1.18
 
 require (
 	github.com/BurntSushi/toml v1.3.2
+	github.com/pierrec/lz4/v4 v4.1.25
 	github.com/spf13/cobra v1.7.0
 	golang.org/x/crypto v0.17.0
 )

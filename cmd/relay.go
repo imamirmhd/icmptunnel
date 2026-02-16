@@ -7,8 +7,8 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
-	"github.com/user/icmptunnel/config"
-	"github.com/user/icmptunnel/relay"
+	"github.com/imamirmhd/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/relay"
 )
 
 var relayCmd = &cobra.Command{

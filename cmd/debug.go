@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/user/icmptunnel/config"
-	"github.com/user/icmptunnel/diag"
+	"github.com/imamirmhd/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/diag"
 )
 
 var debugCmd = &cobra.Command{
@@ -118,14 +118,14 @@ var stressCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		level, _ := cmd.Flags().GetString("level")
 		duration, _ := cmd.Flags().GetDuration("duration")
-		
+
 		d, err := diag.New()
 		if err != nil {
 			return err
 		}
 		defer d.Close()
 		loadToken(d, cmd)
-		
+
 		_, err = d.StressTest(args[0], level, duration)
 		return err
 	},

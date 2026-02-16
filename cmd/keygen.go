@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	"github.com/user/icmptunnel/auth"
+	"github.com/imamirmhd/icmptunnel/auth"
 )
 
 var keygenCmd = &cobra.Command{

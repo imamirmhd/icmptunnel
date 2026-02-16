@@ -15,7 +15,6 @@ type ChaChaEncryptor struct {
 }
 
 // NewChaChaEncryptor creates a new ChaCha20-Poly1305 encryptor.
-// Key must be exactly 32 bytes.
 func NewChaChaEncryptor(key []byte) (*ChaChaEncryptor, error) {
 	if len(key) != chacha20poly1305.KeySize {
 		return nil, fmt.Errorf("ChaCha20-Poly1305 requires a %d-byte key, got %d bytes",
@@ -31,7 +30,6 @@ func NewChaChaEncryptor(key []byte) (*ChaChaEncryptor, error) {
 }
 
 // Encrypt encrypts plaintext using ChaCha20-Poly1305.
-// Output format: [nonce][ciphertext+tag]
 func (c *ChaChaEncryptor) Encrypt(plaintext []byte) ([]byte, error) {
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
@@ -43,7 +41,6 @@ func (c *ChaChaEncryptor) Encrypt(plaintext []byte) ([]byte, error) {
 }
 
 // Decrypt decrypts ciphertext using ChaCha20-Poly1305.
-// Input format: [nonce][ciphertext+tag]
 func (c *ChaChaEncryptor) Decrypt(ciphertext []byte) ([]byte, error) {
 	nonceSize := c.aead.NonceSize()
 	if len(ciphertext) < nonceSize {
@@ -59,12 +56,5 @@ func (c *ChaChaEncryptor) Decrypt(ciphertext []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-// Name returns the encryptor name.
-func (c *ChaChaEncryptor) Name() string {
-	return "chacha20-poly1305"
-}
-
-// Overhead returns the encryption overhead in bytes (nonce + tag).
-func (c *ChaChaEncryptor) Overhead() int {
-	return c.aead.NonceSize() + c.aead.Overhead()
-}
+func (c *ChaChaEncryptor) Name() string  { return "chacha20-poly1305" }
+func (c *ChaChaEncryptor) Overhead() int { return c.aead.NonceSize() + c.aead.Overhead() }

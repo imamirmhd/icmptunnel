@@ -16,18 +16,20 @@ var (
 
 var rootCmd = &cobra.Command{
 	Use:   "icmptunnel",
-	Short: "ICMP tunnel - tunnel network traffic through ICMP packets",
+	Short: "High-performance ICMP tunnel with DPI evasion",
 	Long: `icmptunnel tunnels TCP/UDP traffic through ICMP echo/reply packets,
 bypassing firewalls and captive portals that allow ICMP traffic.
 
 Features:
+  • Multi-stream multiplexing with congestion control
   • SOCKS5 proxy with optional authentication
   • TCP/UDP port forwarding
-  • Multiple encryption methods (AES-256-GCM, ChaCha20-Poly1305, XOR)
-  • DPI evasion techniques (fragmentation, padding, jitter, mimicry)
+  • AES-256-GCM / ChaCha20-Poly1305 / XOR encryption
+  • LZ4 compression with CRC32 integrity
+  • DPI evasion (fragmentation, padding, jitter, mimicry, traffic shaping)
   • ICMP spoofing with relay server support
-  • Comprehensive diagnostics and debugging
-  • systemd service management`,
+  • Fast retransmit & zero-downtime reconnect
+  • Real-time stats & diagnostics`,
 }
 
 // Execute runs the root command.

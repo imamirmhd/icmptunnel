@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/user/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/config"
 )
 
 func TestRealWorldSimulation(t *testing.T) {

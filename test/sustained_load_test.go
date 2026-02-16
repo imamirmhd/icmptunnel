@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/config"
 )
 
 func TestSustainedRealWorldLoad(t *testing.T) {

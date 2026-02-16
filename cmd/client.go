@@ -7,8 +7,8 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
-	"github.com/user/icmptunnel/config"
-	"github.com/user/icmptunnel/tunnel"
+	"github.com/imamirmhd/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/tunnel"
 )
 
 var clientCmd = &cobra.Command{
@@ -37,6 +37,10 @@ func runClient(cmd *cobra.Command, args []string) error {
 		fmt.Println("Configuration is valid.")
 		fmt.Printf("  Server: %s\n", cfg.ServerAddr)
 		fmt.Printf("  Encryption: %v (%s)\n", cfg.Encryption.Enabled, cfg.Encryption.Method)
+		fmt.Printf("  Compression: %s\n", cfg.Transport.Compression)
+		fmt.Printf("  Window size: %d\n", cfg.Transport.WindowSize)
+		fmt.Printf("  Sender workers: %d\n", cfg.Transport.SenderWorkers)
+		fmt.Printf("  CRC: %v\n", cfg.Transport.EnableCRC)
 		fmt.Printf("  SOCKS5 proxies: %d\n", len(cfg.Socks5))
 		for _, s := range cfg.Socks5 {
 			auth := "no auth"
@@ -50,6 +54,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 			fmt.Printf("    - %s -> %s (%s)\n", f.Listen, f.Destination, f.Protocol)
 		}
 		fmt.Printf("  Spoofing: %v\n", cfg.Spoof.Enabled)
+		fmt.Printf("  Recovery: enabled=%v max_reconnects=%d\n", cfg.Recovery.Enabled, cfg.Recovery.MaxReconnects)
 		return nil
 	}
 
@@ -69,13 +74,11 @@ func runClient(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Wait for signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
 	fmt.Printf("\nReceived %v, shutting down...\n", sig)
 
-	// Listen for a second signal for force exit
 	go func() {
 		sig2 := <-sigCh
 		fmt.Printf("\nReceived %v again, force exiting...\n", sig2)

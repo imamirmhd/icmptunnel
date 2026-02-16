@@ -28,7 +28,7 @@ func NewEncryptor(method string, key []byte) (Encryptor, error) {
 // NopEncryptor is a no-op encryptor that passes data through unchanged.
 type NopEncryptor struct{}
 
-func (n *NopEncryptor) Encrypt(plaintext []byte) ([]byte, error)   { return plaintext, nil }
+func (n *NopEncryptor) Encrypt(plaintext []byte) ([]byte, error)  { return plaintext, nil }
 func (n *NopEncryptor) Decrypt(ciphertext []byte) ([]byte, error) { return ciphertext, nil }
-func (n *NopEncryptor) Name() string                               { return "none" }
+func (n *NopEncryptor) Name() string                              { return "none" }
 func (n *NopEncryptor) Overhead() int                             { return 0 }

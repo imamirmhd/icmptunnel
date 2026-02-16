@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/icmptunnel/config"
-	"github.com/user/icmptunnel/tunnel"
+	"github.com/imamirmhd/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/tunnel"
 )
 
 func TestStabilityAndRecovery(t *testing.T) {

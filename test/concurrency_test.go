@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/icmptunnel/config"
+	"github.com/imamirmhd/icmptunnel/config"
 )
 
 func TestConcurrencyAndLoad(t *testing.T) {

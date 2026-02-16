@@ -1,6 +1,6 @@
 package main
 
-import "github.com/user/icmptunnel/cmd"
+import "github.com/imamirmhd/icmptunnel/cmd"
 
 func main() {
 	cmd.Execute()

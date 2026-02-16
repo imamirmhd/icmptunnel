@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	"github.com/user/icmptunnel/service"
+	"github.com/imamirmhd/icmptunnel/service"
 )
 
 var serviceCmd = &cobra.Command{

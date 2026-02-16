@@ -21,7 +21,6 @@ const (
 	ERROR
 )
 
-// String returns the string representation of a log level.
 func (l Level) String() string {
 	switch l {
 	case DEBUG:
@@ -55,12 +54,12 @@ func ParseLevel(s string) Level {
 
 // Logger provides structured logging with context fields.
 type Logger struct {
-	mu        sync.Mutex
 	level     Level
 	component string
 	sessionID string
 	writer    io.Writer
 	logger    *log.Logger
+	mu        sync.Mutex
 }
 
 var (
@@ -150,22 +149,7 @@ func (l *Logger) log(level Level, format string, args ...interface{}) {
 	l.logger.Printf("%s %s", fields, msg)
 }
 
-// Debug logs a debug message.
-func (l *Logger) Debug(format string, args ...interface{}) {
-	l.log(DEBUG, format, args...)
-}
-
-// Info logs an info message.
-func (l *Logger) Info(format string, args ...interface{}) {
-	l.log(INFO, format, args...)
-}
-
-// Warn logs a warning message.
-func (l *Logger) Warn(format string, args ...interface{}) {
-	l.log(WARN, format, args...)
-}
-
-// Error logs an error message.
-func (l *Logger) Error(format string, args ...interface{}) {
-	l.log(ERROR, format, args...)
-}
+func (l *Logger) Debug(format string, args ...interface{}) { l.log(DEBUG, format, args...) }
+func (l *Logger) Info(format string, args ...interface{})  { l.log(INFO, format, args...) }
+func (l *Logger) Warn(format string, args ...interface{})  { l.log(WARN, format, args...) }
+func (l *Logger) Error(format string, args ...interface{}) { l.log(ERROR, format, args...) }

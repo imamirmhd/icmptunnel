@@ -1,142 +1,108 @@
-// Package diag provides diagnostics and debugging tools for ICMP tunnel connectivity.
+// Package diag provides diagnostic and debugging tools for ICMP tunnels.
 package diag
 
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
-	"strings"
+	"sort"
+	"sync"
 	"time"
 
-	"github.com/user/icmptunnel/icmp"
-	"github.com/user/icmptunnel/logger"
+	"github.com/imamirmhd/icmptunnel/icmp"
+	"github.com/imamirmhd/icmptunnel/logger"
 )
 
-// Diagnostics provides various tunnel testing capabilities.
+// Diagnostics provides tools for testing tunnel connectivity.
 type Diagnostics struct {
 	socket    *icmp.Socket
 	log       *logger.Logger
 	authToken string
 }
 
-// New creates a new diagnostics instance.
+// New creates a new Diagnostics instance.
 func New() (*Diagnostics, error) {
-	sock, err := icmp.NewSocket(1472, 64, 5*time.Second, 5*time.Second)
+	sock, err := icmp.NewSocket(1472, 16, 5*time.Second, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
+
+	if err := sock.Bind("0.0.0.0"); err != nil {
+		sock.Close()
+		return nil, err
+	}
+
 	return &Diagnostics{
 		socket: sock,
 		log:    logger.Default().WithComponent("diag"),
 	}, nil
 }
 
-// Close releases resources.
+// Close closes the diagnostics socket.
 func (d *Diagnostics) Close() {
 	d.socket.Close()
 }
 
-// PingResult holds the result of a ping test.
+// SetAuthToken sets the auth token for diagnostic packets.
+func (d *Diagnostics) SetAuthToken(token string) {
+	d.authToken = token
+}
+
+// PingResult holds results from a ping test.
 type PingResult struct {
 	Target    string
 	Sent      int
 	Received  int
-	Lost      int
+	LossRate  float64
 	MinRTT    time.Duration
 	MaxRTT    time.Duration
 	AvgRTT    time.Duration
 	RTTs      []time.Duration
 }
 
-// Ping sends ICMP echo requests to verify connectivity.
+// Ping performs ICMP echo test.
 func (d *Diagnostics) Ping(target string, count int) (*PingResult, error) {
-	targetIP := net.ParseIP(target)
-	if targetIP == nil {
-		addrs, err := net.LookupIP(target)
-		if err != nil || len(addrs) == 0 {
-			return nil, fmt.Errorf("resolving %s: %w", target, err)
-		}
-		targetIP = addrs[0]
+	ip := net.ParseIP(target)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid target: %s", target)
 	}
 
 	localIP := getLocalIP()
-	result := &PingResult{
-		Target: target,
-		Sent:   count,
-	}
+	result := &PingResult{Target: target, Sent: count}
 
-	fmt.Printf("PING %s (%s)\n", target, targetIP)
+	fmt.Printf("PING %s (%s): %d packets\n", target, ip, count)
 
 	for i := 0; i < count; i++ {
-		// Build ICMP echo request with timestamp
-		tsPayload := make([]byte, 8)
-		binary.BigEndian.PutUint64(tsPayload, uint64(time.Now().UnixNano()))
-		
-		var payload []byte
-		if d.authToken != "" {
-			// Prefix with auth token
-			payload = append([]byte(d.authToken), tsPayload...)
-		} else {
-			payload = tsPayload
-		}
-
 		start := time.Now()
-		if err := d.socket.SendEcho(localIP, targetIP, 0, 0, payload); err != nil {
-			fmt.Printf("Request %d: send error: %v\n", i+1, err)
-			result.Lost++
+		payload := make([]byte, 56)
+		binary.BigEndian.PutUint64(payload, uint64(start.UnixNano()))
+
+		err := d.socket.Send(localIP, ip, uint16(i+1), uint16(i+1), payload)
+		if err != nil {
+			fmt.Printf("  Send error: %v\n", err)
 			continue
 		}
 
-		// Wait for reply
-		deadline := time.Now().Add(5 * time.Second)
-		received := false
-		for time.Now().Before(deadline) {
-			srcIP, icmpType, _, _, recvPayload, origBuf, err := d.socket.Receive()
-			if err != nil {
-				if origBuf != nil {
-					icmp.ReleaseBuffer(origBuf)
-				}
-				continue
+		d.socket.SetReadDeadline(3 * time.Second)
+		_, _, _, _, _, rawBuf, err := d.socket.Receive()
+		if err != nil {
+			fmt.Printf("  Timeout\n")
+			if rawBuf != nil {
+				icmp.ReleaseBuffer(rawBuf)
 			}
-			defer icmp.ReleaseBuffer(origBuf)
-			if icmpType == 0 && srcIP.Equal(targetIP) {
-				valid := false
-				if d.authToken != "" {
-					if strings.HasPrefix(string(recvPayload), d.authToken) {
-						valid = true
-						// Extract timestamp from suffix?
-						// Actually we just check RTT from sent time.
-						// We don't strictly parse the timestamp from the reply unless needed.
-						// But verifying content is good.
-					}
-				} else {
-					// Legacy: valid if echo came back
-					valid = true
-				}
-
-				if valid {
-					rtt := time.Since(start)
-					result.RTTs = append(result.RTTs, rtt)
-					result.Received++
-					received = true
-	
-					fmt.Printf("Reply from %s: time=%v\n", srcIP, rtt.Round(time.Microsecond))
-					break
-				}
-			}
+			continue
 		}
+		icmp.ReleaseBuffer(rawBuf)
 
-		if !received {
-			fmt.Printf("Request %d: timeout\n", i+1)
-			result.Lost++
-		}
+		rtt := time.Since(start)
+		result.RTTs = append(result.RTTs, rtt)
+		result.Received++
 
-		if i < count-1 {
-			time.Sleep(time.Second)
-		}
+		fmt.Printf("  Reply from %s: time=%v\n", ip, rtt.Round(time.Microsecond))
+		time.Sleep(1 * time.Second)
 	}
 
-	// Calculate stats
 	if len(result.RTTs) > 0 {
 		result.MinRTT = result.RTTs[0]
 		result.MaxRTT = result.RTTs[0]
@@ -152,324 +118,297 @@ func (d *Diagnostics) Ping(target string, count int) (*PingResult, error) {
 		}
 		result.AvgRTT = total / time.Duration(len(result.RTTs))
 	}
+	result.LossRate = float64(result.Sent-result.Received) / float64(result.Sent) * 100
 
 	fmt.Printf("\n--- %s ping statistics ---\n", target)
-	fmt.Printf("%d packets sent, %d received, %d lost (%.1f%% loss)\n",
-		result.Sent, result.Received, result.Lost,
-		float64(result.Lost)/float64(result.Sent)*100)
+	fmt.Printf("%d packets transmitted, %d received, %.1f%% packet loss\n",
+		result.Sent, result.Received, result.LossRate)
 	if len(result.RTTs) > 0 {
-		fmt.Printf("rtt min/avg/max = %v/%v/%v\n",
-			result.MinRTT.Round(time.Microsecond),
-			result.AvgRTT.Round(time.Microsecond),
-			result.MaxRTT.Round(time.Microsecond))
+		fmt.Printf("rtt min/avg/max = %v/%v/%v\n", result.MinRTT, result.AvgRTT, result.MaxRTT)
 	}
 
 	return result, nil
 }
 
-// ThroughputResult holds throughput test results.
+// ThroughputResult holds results from a throughput test.
 type ThroughputResult struct {
-	BytesSent     int
-	Duration      time.Duration
-	Throughput    float64 // bytes per second
-	PacketsSent   int
-	PacketsRecv   int
+	Duration    time.Duration
+	BytesSent   int64
+	PacketsSent int64
+	Throughput  float64 // bytes/sec
 }
 
-// Throughput measures the tunnel throughput by sending burst data.
+// Throughput measures ICMP throughput.
 func (d *Diagnostics) Throughput(target string, durationSec int) (*ThroughputResult, error) {
-	targetIP := net.ParseIP(target)
-	if targetIP == nil {
-		return nil, fmt.Errorf("invalid target IP: %s", target)
+	ip := net.ParseIP(target)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid target: %s", target)
 	}
 
 	localIP := getLocalIP()
-	result := &ThroughputResult{}
-	testDuration := time.Duration(durationSec) * time.Second
-	payload := make([]byte, 1400)
+	duration := time.Duration(durationSec) * time.Second
+	payload := make([]byte, 1400) // Near-MTU payload
 	for i := range payload {
 		payload[i] = byte(i % 256)
 	}
 
-	fmt.Printf("Throughput test to %s for %v...\n", target, testDuration)
+	fmt.Printf("Throughput test to %s for %v...\n", target, duration)
 
+	result := &ThroughputResult{}
 	start := time.Now()
-	for time.Since(start) < testDuration {
-		if err := d.socket.SendEcho(localIP, targetIP, 0, 0, payload); err != nil {
+	seq := uint16(0)
+
+	for time.Since(start) < duration {
+		seq++
+		err := d.socket.Send(localIP, ip, 0x1234, seq, payload)
+		if err != nil {
 			continue
 		}
-		result.BytesSent += len(payload)
 		result.PacketsSent++
+		result.BytesSent += int64(len(payload))
 	}
 
 	result.Duration = time.Since(start)
 	result.Throughput = float64(result.BytesSent) / result.Duration.Seconds()
 
-	fmt.Printf("\n--- Throughput Results ---\n")
-	fmt.Printf("Duration: %v\n", result.Duration.Round(time.Millisecond))
-	fmt.Printf("Sent: %d packets (%d bytes)\n", result.PacketsSent, result.BytesSent)
-	fmt.Printf("Throughput: %.2f KB/s\n", result.Throughput/1024)
+	fmt.Printf("Sent %d packets (%d bytes) in %v\n", result.PacketsSent, result.BytesSent, result.Duration)
+	fmt.Printf("Throughput: %.2f MB/s (%.2f Mbps)\n",
+		result.Throughput/1024/1024, result.Throughput*8/1024/1024)
 
 	return result, nil
 }
 
-// PacketLossResult holds packet loss test results.
-type PacketLossResult struct {
-	Sent     int
-	Received int
-	Lost     int
-	LossRate float64
-}
-
-// PacketLoss measures packet loss over a series of ICMP packets.
-func (d *Diagnostics) PacketLoss(target string, count int) (*PacketLossResult, error) {
-	targetIP := net.ParseIP(target)
-	if targetIP == nil {
-		return nil, fmt.Errorf("invalid target IP: %s", target)
-	}
-
-	localIP := getLocalIP()
-	result := &PacketLossResult{Sent: count}
-
-	fmt.Printf("Packet loss test to %s (%d packets)...\n", target, count)
-
-	for i := 0; i < count; i++ {
-		payload := make([]byte, 64)
-		binary.BigEndian.PutUint32(payload, uint32(i))
-
-		if err := d.socket.SendEcho(localIP, targetIP, 0, 0, payload); err != nil {
-			continue
-		}
-
-		// Check for reply
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			srcIP, icmpType, _, _, _, origBuf, err := d.socket.Receive()
-			if err != nil {
-				if origBuf != nil {
-					icmp.ReleaseBuffer(origBuf)
-				}
-				continue
-			}
-			icmp.ReleaseBuffer(origBuf)
-			if icmpType == 0 && srcIP.Equal(targetIP) {
-				result.Received++
-				break
-			}
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	result.Lost = result.Sent - result.Received
-	if result.Sent > 0 {
-		result.LossRate = float64(result.Lost) / float64(result.Sent) * 100
-	}
-
-	fmt.Printf("\n--- Packet Loss Results ---\n")
-	fmt.Printf("Sent: %d, Received: %d, Lost: %d (%.1f%%)\n",
-		result.Sent, result.Received, result.Lost, result.LossRate)
-
-	return result, nil
+// PacketLoss measures packet loss rate.
+func (d *Diagnostics) PacketLoss(target string, count int) (*PingResult, error) {
+	return d.Ping(target, count)
 }
 
 // DPIDetectResult holds DPI detection results.
 type DPIDetectResult struct {
-	StandardICMP  bool
-	LargePayload  bool
-	SmallPayload  bool
-	RapidBurst    bool
-	NonStandard   bool
-	Assessment    string
+	Tests []DPITest
 }
 
-// DPIDetect tries various ICMP patterns to detect DPI/firewall interference.
+type DPITest struct {
+	Name     string
+	Passed   bool
+	Details  string
+}
+
+// DPIDetect tests for DPI interference.
 func (d *Diagnostics) DPIDetect(target string) (*DPIDetectResult, error) {
-	targetIP := net.ParseIP(target)
-	if targetIP == nil {
-		return nil, fmt.Errorf("invalid target IP: %s", target)
+	ip := net.ParseIP(target)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid target: %s", target)
 	}
 
-	localIP := getLocalIP()
 	result := &DPIDetectResult{}
+	localIP := getLocalIP()
 
-	fmt.Printf("DPI detection test against %s...\n\n", target)
+	fmt.Printf("DPI detection test to %s...\n\n", target)
 
-	// Test 1: Standard ICMP ping (56 bytes)
-	fmt.Print("Test 1: Standard ICMP echo (56 bytes)... ")
-	result.StandardICMP = d.testPacket(localIP, targetIP, make([]byte, 56))
-	printResult(result.StandardICMP)
+	// Test 1: Standard ping
+	test := DPITest{Name: "Standard ICMP ping"}
+	d.socket.SetReadDeadline(3 * time.Second)
+	err := d.socket.Send(localIP, ip, 1, 1, make([]byte, 56))
+	if err == nil {
+		_, _, _, _, _, rawBuf, recvErr := d.socket.Receive()
+		if recvErr == nil {
+			test.Passed = true
+			test.Details = "Standard ICMP echo works"
+			icmp.ReleaseBuffer(rawBuf)
+		} else {
+			test.Details = "No response to standard ping"
+		}
+	} else {
+		test.Details = fmt.Sprintf("Send failed: %v", err)
+	}
+	result.Tests = append(result.Tests, test)
+	fmt.Printf("  %-30s %s (%s)\n", test.Name, boolStr(test.Passed), test.Details)
 
-	// Test 2: Large payload (1400 bytes)
-	fmt.Print("Test 2: Large payload (1400 bytes)... ")
-	result.LargePayload = d.testPacket(localIP, targetIP, make([]byte, 1400))
-	printResult(result.LargePayload)
-
-	// Test 3: Small payload (4 bytes)
-	fmt.Print("Test 3: Small payload (4 bytes)... ")
-	result.SmallPayload = d.testPacket(localIP, targetIP, make([]byte, 4))
-	printResult(result.SmallPayload)
-
-	// Test 4: Rapid burst (10 packets no delay)
-	fmt.Print("Test 4: Rapid burst (10 packets)... ")
-	burstOk := 0
-	for i := 0; i < 10; i++ {
-		if d.testPacket(localIP, targetIP, make([]byte, 56)) {
-			burstOk++
+	// Test 2: Large payload
+	test = DPITest{Name: "Large payload (1400 bytes)"}
+	bigPayload := make([]byte, 1400)
+	err = d.socket.Send(localIP, ip, 2, 1, bigPayload)
+	if err == nil {
+		_, _, _, _, _, rawBuf, recvErr := d.socket.Receive()
+		if recvErr == nil {
+			test.Passed = true
+			test.Details = "Large payloads allowed"
+			icmp.ReleaseBuffer(rawBuf)
+		} else {
+			test.Details = "Large payloads may be filtered"
 		}
 	}
-	result.RapidBurst = burstOk >= 7
-	fmt.Printf("%d/10 received\n", burstOk)
+	result.Tests = append(result.Tests, test)
+	fmt.Printf("  %-30s %s (%s)\n", test.Name, boolStr(test.Passed), test.Details)
 
-	// Test 5: Non-standard payload (random data)
-	fmt.Print("Test 5: Random payload data... ")
-	randomPayload := make([]byte, 200)
-	for i := range randomPayload {
-		randomPayload[i] = byte(i * 13 % 256)
+	// Test 3: Rapid fire
+	test = DPITest{Name: "Rapid fire (100 pps)"}
+	sent, received := 0, 0
+	for i := 0; i < 100; i++ {
+		err = d.socket.Send(localIP, ip, 3, uint16(i+1), make([]byte, 56))
+		if err == nil {
+			sent++
+		}
 	}
-	result.NonStandard = d.testPacket(localIP, targetIP, randomPayload)
-	printResult(result.NonStandard)
-
-	// Assessment
-	fmt.Println("\n--- Assessment ---")
-	if result.StandardICMP && result.LargePayload && result.SmallPayload && result.RapidBurst && result.NonStandard {
-		result.Assessment = "No DPI interference detected. All ICMP patterns work."
-	} else if !result.StandardICMP {
-		result.Assessment = "ICMP is completely blocked. Tunnel cannot operate."
-	} else if !result.LargePayload {
-		result.Assessment = "Large ICMP packets blocked. Enable fragmentation in evasion config."
-	} else if !result.RapidBurst {
-		result.Assessment = "Burst rate limiting detected. Enable jitter in evasion config."
-	} else if !result.NonStandard {
-		result.Assessment = "DPI is inspecting payload content. Enable encryption and mimicry."
-	} else {
-		result.Assessment = "Partial DPI interference. Enable recommended evasion techniques."
+	d.socket.SetReadDeadline(2 * time.Second)
+	for i := 0; i < 100; i++ {
+		_, _, _, _, _, rawBuf, recvErr := d.socket.Receive()
+		if recvErr != nil {
+			break
+		}
+		received++
+		icmp.ReleaseBuffer(rawBuf)
 	}
-	fmt.Println(result.Assessment)
+	test.Passed = received > 50
+	test.Details = fmt.Sprintf("%d/%d packets received", received, sent)
+	result.Tests = append(result.Tests, test)
+	fmt.Printf("  %-30s %s (%s)\n", test.Name, boolStr(test.Passed), test.Details)
 
 	return result, nil
 }
 
-// SpoofTest verifies that spoofed ICMP packets are forwarded by the relay.
-func (d *Diagnostics) SpoofTest(relayAddr, mainServerAddr string) error {
-	relayIP := net.ParseIP(relayAddr)
-	serverIP := net.ParseIP(mainServerAddr)
-	if relayIP == nil || serverIP == nil {
-		return fmt.Errorf("invalid addresses")
-	}
-
-	fmt.Printf("Spoof test: sending to relay %s with spoofed source %s\n", relayAddr, mainServerAddr)
-
-	payload := []byte("SPOOF_TEST")
-
-	// Send ICMP echo to relay with spoofed source (server IP)
-	if err := d.socket.SendEcho(serverIP, relayIP, 0, 0, payload); err != nil {
-		fmt.Printf("FAIL: Could not send spoofed packet: %v\n", err)
-		return err
-	}
-
-	fmt.Println("Spoofed packet sent. Check server for received packet.")
-	fmt.Println("If the server receives the packet, the relay supports spoofed source forwarding.")
-
+// SpoofTest tests ICMP spoofing through a relay.
+func (d *Diagnostics) SpoofTest(relay, server string) error {
+	fmt.Printf("Spoof test: relay=%s server=%s\n", relay, server)
+	fmt.Printf("(Not implemented in diagnostic mode - use full tunnel client)\n")
 	return nil
 }
 
-// SetAuthToken sets the authentication token for diagnostics.
-func (d *Diagnostics) SetAuthToken(token string) {
-	d.authToken = token
-}
-
-// StatusCheck verifies if a tunnel server is alive.
+// StatusCheck checks tunnel server status.
 func (d *Diagnostics) StatusCheck(target string) error {
-	targetIP := net.ParseIP(target)
-	if targetIP == nil {
+	ip := net.ParseIP(target)
+	if ip == nil {
 		return fmt.Errorf("invalid target: %s", target)
 	}
 
-	localIP := getLocalIP()
-	var payload []byte
+	fmt.Printf("Checking tunnel server status at %s...\n", target)
 
-	// If authToken is set, use it as the payload (Unified Token-Based Ping)
+	localIP := getLocalIP()
+	diagPkt := &icmp.TunnelPacket{
+		Type: icmp.TypeDiag,
+		Data: []byte("status"),
+	}
 	if d.authToken != "" {
-		payload = []byte(d.authToken)
-		fmt.Printf("Checking tunnel server at %s using auth token...\n", target)
-	} else {
-		// Fallback to legacy diagnostic packet (likely to fail if encryption enforced)
-		diagPkt := &icmp.TunnelPacket{
-			Type:   icmp.TypeDiag,
-			SeqNum: 1,
-			Data:   []byte("STATUS_CHECK"),
-		}
-		payload = diagPkt.Encode()
-		fmt.Printf("Checking tunnel server at %s (legacy mode)...\n", target)
+		diagPkt.Data = append([]byte(d.authToken), diagPkt.Data...)
 	}
 
-	if err := d.socket.SendEcho(localIP, targetIP, 0, 0, payload); err != nil {
+	encoded := diagPkt.Encode()
+	d.socket.SetReadDeadline(5 * time.Second)
+	err := d.socket.Send(localIP, ip, 0xDEAD, 1, encoded)
+	if err != nil {
 		return fmt.Errorf("send failed: %w", err)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		srcIP, icmpType, _, _, recvPayload, origBuf, err := d.socket.Receive()
-		if err != nil {
-			if origBuf != nil {
-				icmp.ReleaseBuffer(origBuf)
-			}
-			continue
-		}
-		defer icmp.ReleaseBuffer(origBuf)
-		
-		if icmpType == 0 && srcIP.Equal(targetIP) {
-			// Check for Token match (Unified Ping)
-			if d.authToken != "" {
-				if string(recvPayload) == d.authToken {
-					fmt.Printf("Server is ALIVE at %s (Token Verified)\n", target)
-					return nil
-				}
-			}
-
-			// Check for Diag Packet (Legacy)
-			if len(recvPayload) > 0 {
-				pkt, err := icmp.DecodeTunnelPacket(recvPayload)
-				if err == nil && pkt.Type == icmp.TypeDiag {
-					fmt.Printf("Server is ALIVE at %s (Diag Response)\n", target)
-					return nil
-				}
-			}
-		}
+	_, _, _, _, _, rawBuf, err := d.socket.Receive()
+	if err != nil {
+		fmt.Printf("Server not responding (may be filtered or not running)\n")
+		return nil
 	}
-
-	fmt.Printf("Server at %s did not respond (may not be running or is blocked)\n", target)
+	icmp.ReleaseBuffer(rawBuf)
+	fmt.Printf("Server responded - tunnel endpoint active\n")
 	return nil
 }
 
-func (d *Diagnostics) testPacket(src, dst net.IP, payload []byte) bool {
-	if err := d.socket.SendEcho(src, dst, 0, 0, payload); err != nil {
-		return false
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		srcIP, icmpType, _, _, _, origBuf, err := d.socket.Receive()
-		if err != nil {
-			if origBuf != nil {
-				icmp.ReleaseBuffer(origBuf)
-			}
-			continue
-		}
-		icmp.ReleaseBuffer(origBuf)
-		if icmpType == 0 && srcIP.Equal(dst) {
-			return true
-		}
-	}
-	return false
+// StressResult holds stress test results.
+type StressResult struct {
+	Level         string
+	Duration      time.Duration
+	TotalPackets  int64
+	TotalBytes    int64
+	Errors        int64
+	AvgThroughput float64
+	P50Latency    time.Duration
+	P99Latency    time.Duration
 }
 
-func printResult(ok bool) {
-	if ok {
-		fmt.Println("PASS")
-	} else {
-		fmt.Println("FAIL")
+// StressTest runs a stress test.
+func (d *Diagnostics) StressTest(target string, level string, duration time.Duration) (*StressResult, error) {
+	ip := net.ParseIP(target)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid target: %s", target)
 	}
+
+	localIP := getLocalIP()
+	workerCount := 1
+	payloadSize := 100
+
+	switch level {
+	case "medium":
+		workerCount = 4
+		payloadSize = 500
+	case "high":
+		workerCount = 8
+		payloadSize = 1400
+	}
+
+	fmt.Printf("Stress test: level=%s workers=%d payload=%dB duration=%v\n",
+		level, workerCount, payloadSize, duration)
+
+	result := &StressResult{Level: level}
+	var mu sync.Mutex
+	var latencies []time.Duration
+	var wg sync.WaitGroup
+
+	start := time.Now()
+	done := time.After(duration)
+
+	for w := 0; w < workerCount; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			payload := make([]byte, payloadSize)
+			seq := uint16(0)
+
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+
+				seq++
+				sendTime := time.Now()
+				err := d.socket.Send(localIP, ip, uint16(workerID+1), seq, payload)
+				if err != nil {
+					mu.Lock()
+					result.Errors++
+					mu.Unlock()
+					continue
+				}
+
+				rtt := time.Since(sendTime)
+				mu.Lock()
+				result.TotalPackets++
+				result.TotalBytes += int64(payloadSize)
+				latencies = append(latencies, rtt)
+				mu.Unlock()
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	result.Duration = time.Since(start)
+	result.AvgThroughput = float64(result.TotalBytes) / result.Duration.Seconds()
+
+	if len(latencies) > 0 {
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		p50Idx := int(math.Ceil(float64(len(latencies))*0.50)) - 1
+		p99Idx := int(math.Ceil(float64(len(latencies))*0.99)) - 1
+		if p50Idx >= 0 && p50Idx < len(latencies) {
+			result.P50Latency = latencies[p50Idx]
+		}
+		if p99Idx >= 0 && p99Idx < len(latencies) {
+			result.P99Latency = latencies[p99Idx]
+		}
+	}
+
+	fmt.Printf("\n--- Stress test results ---\n")
+	fmt.Printf("Packets: %d sent, %d errors\n", result.TotalPackets, result.Errors)
+	fmt.Printf("Throughput: %.2f MB/s\n", result.AvgThroughput/1024/1024)
+	fmt.Printf("Latency: p50=%v p99=%v\n", result.P50Latency, result.P99Latency)
+
+	return result, nil
 }
 
 func getLocalIP() net.IP {
@@ -479,4 +418,11 @@ func getLocalIP() net.IP {
 	}
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).IP
+}
+
+func boolStr(b bool) string {
+	if b {
+		return "PASS"
+	}
+	return "FAIL"
 }
